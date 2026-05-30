@@ -1,0 +1,9 @@
+.cache
+.pnpm-store
+data
+node_modules
+artifacts
+web/node_modules
+web/dist
+web/src/.umi
+web/src/.umi-production

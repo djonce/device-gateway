@@ -1,0 +1,13 @@
+{
+  "name": "light-gateway",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --dir web dev",
+    "dev:web": "pnpm --dir web dev",
+    "dev:gateway": "go run ./cmd/gateway",
+    "dev:agent": "go run ./cmd/agent",
+    "dev:serial": "go run ./cmd/serial-agent",
+    "test": "go test ./...",
+    "build": "go build ./cmd/gateway ./cmd/agent ./cmd/serial-agent && pnpm --dir web build"
+  }
+}
