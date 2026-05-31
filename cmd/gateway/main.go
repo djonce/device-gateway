@@ -10,7 +10,10 @@ import (
 	"syscall"
 	"time"
 
+	"light-gateway/internal/auth"
 	"light-gateway/internal/device"
+	"light-gateway/internal/realtime"
+	"light-gateway/internal/weather"
 )
 
 func main() {
@@ -26,7 +29,32 @@ func main() {
 	defer store.Close()
 
 	mux := http.NewServeMux()
-	device.NewAPI(store, logger).RegisterRoutes(mux)
+	weatherSvc := weather.NewService(logger)
+	voiceCfg := realtime.PipelineConfig{
+		LLMURL:       os.Getenv("LIGHT_VOICE_LLM_URL"),
+		LLMKey:       os.Getenv("LIGHT_VOICE_LLM_KEY"),
+		LLMModel:     os.Getenv("LIGHT_VOICE_LLM_MODEL"),
+		SystemPrompt: os.Getenv("LIGHT_VOICE_PROMPT"),
+		ASRURL:       os.Getenv("LIGHT_VOICE_ASR_URL"),
+		TTSURL:       os.Getenv("LIGHT_VOICE_TTS_URL"),
+		AudioCodec:   os.Getenv("LIGHT_VOICE_CODEC"), // pcm16 (default) or opus
+	}
+	var voicePipeline realtime.Pipeline
+	if voiceCfg.LLMURL != "" || voiceCfg.ASRURL != "" || voiceCfg.TTSURL != "" || voiceCfg.AudioCodec != "" {
+		voicePipeline = realtime.NewHTTPPipeline(voiceCfg)
+		logger.Info("voice pipeline configured", "llm", voiceCfg.LLMURL != "", "asr", voiceCfg.ASRURL != "", "tts", voiceCfg.TTSURL != "", "codec", voiceCfg.AudioCodec)
+	}
+	hub := realtime.NewHub(logger, voicePipeline) // nil -> echo placeholder
+	hub.OnEvent(store.RecordEvent)                // mirror realtime connect/session events into the event stream
+
+	authn := auth.New(os.Getenv("LIGHT_ADMIN_USER"), os.Getenv("LIGHT_ADMIN_PASSWORD"))
+	if authn.Enabled() {
+		logger.Info("admin auth enabled")
+	} else {
+		logger.Warn("admin auth disabled — set LIGHT_ADMIN_PASSWORD to require login for the management API")
+	}
+
+	device.NewAPI(store, logger, weatherSvc, hub, authn).RegisterRoutes(mux)
 	handler := withCORS(withRequestLog(logger, mux))
 
 	server := &http.Server{

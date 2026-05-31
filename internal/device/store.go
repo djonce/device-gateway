@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,6 +30,13 @@ var (
 const (
 	staleAfter   = 2 * time.Minute
 	offlineAfter = 10 * time.Minute
+
+	// In-memory and on-disk retention caps. The store keeps the most recent
+	// rows per device (telemetry, commands) and globally (events); older rows
+	// are pruned. In-flight commands (queued/delivered) are never pruned.
+	telemetryPerDevice = 500
+	commandsPerDevice  = 200
+	eventBacklog       = 1000
 )
 
 type Store struct {
@@ -36,40 +44,38 @@ type Store struct {
 	path      string
 	storage   string
 	db        *sql.DB
-	devices   map[string]Device
-	tokens    map[string]DeviceToken
-	telemetry map[string][]TelemetryPoint
-	commands  map[string]Command
-	events    []Event
-	now       func() time.Time
-}
-
-type snapshot struct {
-	Devices   map[string]Device           `json:"devices"`
-	Tokens    map[string]DeviceToken      `json:"tokens"`
-	Telemetry map[string][]TelemetryPoint `json:"telemetry"`
-	Commands  map[string]Command          `json:"commands"`
-	Events    []Event                     `json:"events"`
+	devices       map[string]Device
+	tokens        map[string]DeviceToken
+	telemetry     map[string][]TelemetryPoint
+	commands      map[string]Command
+	events        []Event
+	firmwares     map[string]Firmware
+	firmwareBlobs map[string][]byte
+	now           func() time.Time
+	logger        *slog.Logger
 }
 
 func NewStore(path string) (*Store, error) {
 	s := &Store{
 		path:      path,
-		storage:   "json",
-		devices:   map[string]Device{},
-		tokens:    map[string]DeviceToken{},
-		telemetry: map[string][]TelemetryPoint{},
-		commands:  map[string]Command{},
-		events:    []Event{},
-		now:       time.Now,
+		storage:   "memory",
+		devices:       map[string]Device{},
+		tokens:        map[string]DeviceToken{},
+		telemetry:     map[string][]TelemetryPoint{},
+		commands:      map[string]Command{},
+		events:        []Event{},
+		firmwares:     map[string]Firmware{},
+		firmwareBlobs: map[string][]byte{},
+		now:           time.Now,
+		logger:        slog.Default(),
 	}
 	if path == "" {
+		// In-memory only: used for tests and ephemeral/dev runs.
 		return s, nil
 	}
-	if strings.HasSuffix(strings.ToLower(path), ".db") || strings.HasSuffix(strings.ToLower(path), ".sqlite") {
-		s.storage = "sqlite"
-	}
-	if err := s.load(); err != nil {
+	// Any configured data path uses the SQLite backend.
+	s.storage = "sqlite"
+	if err := s.loadSQLite(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -107,6 +113,10 @@ func (s *Store) Register(req RegisterDeviceRequest) (DeviceRegistration, error) 
 		ID:           req.ID,
 		Name:         req.Name,
 		Type:         req.Type,
+		Category:     req.Category,
+		Model:        req.Model,
+		Profile:      resolveProfileID(req.Category, req.Profile),
+		FwVersion:    req.FwVersion,
 		AgentVersion: req.AgentVersion,
 		Labels:       cloneStringMap(req.Labels),
 		Capabilities: cloneCapabilities(req.Capabilities),
@@ -116,6 +126,13 @@ func (s *Store) Register(req RegisterDeviceRequest) (DeviceRegistration, error) 
 		RegisteredAt: registeredAt,
 		UpdatedAt:    now,
 		State:        OnlineStateOnline,
+	}
+	// Preserve server-managed state across re-registration (devices re-register
+	// on every boot and don't report these): geofence and OTA target.
+	if ok {
+		device.Geofence = existing.Geofence
+		device.GeofenceState = existing.GeofenceState
+		device.TargetFwVersion = existing.TargetFwVersion
 	}
 
 	rawToken := ""
@@ -130,11 +147,17 @@ func (s *Store) Register(req RegisterDeviceRequest) (DeviceRegistration, error) 
 			TokenHash: hashToken(token),
 			CreatedAt: now,
 		}
+		if err := s.persistTokenLocked(s.tokens[device.ID]); err != nil {
+			return DeviceRegistration{}, err
+		}
 	}
 	s.applyTokenMetadataLocked(&device)
 	s.devices[device.ID] = device
 	s.appendEventLocked("device.registered", device.ID, "device registered", map[string]any{"name": device.Name, "type": device.Type})
-	return DeviceRegistration{Device: device, Token: rawToken, Reused: ok}, s.persistLocked()
+	if err := s.persistDeviceLocked(device); err != nil {
+		return DeviceRegistration{}, err
+	}
+	return DeviceRegistration{Device: device, Token: rawToken, Reused: ok}, nil
 }
 
 func (s *Store) Heartbeat(deviceID string, req HeartbeatRequest) (Device, error) {
@@ -160,18 +183,22 @@ func (s *Store) Heartbeat(deviceID string, req HeartbeatRequest) (Device, error)
 	}
 	s.devices[device.ID] = device
 	s.appendEventLocked("device.heartbeat", device.ID, "heartbeat received", nil)
-	return device, s.persistLocked()
+	if err := s.persistDeviceLocked(device); err != nil {
+		return Device{}, err
+	}
+	return device, nil
 }
 
 func (s *Store) ListDevices() []Device {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
+	now := s.now().UTC()
 	out := make([]Device, 0, len(s.devices))
-	for id, device := range s.devices {
-		device.State = stateFor(s.now().UTC(), device.LastSeenAt)
+	for _, device := range s.devices {
+		// device is a copy; compute state and token metadata onto the copy only.
+		device.State = stateFor(now, device.LastSeenAt)
 		s.applyTokenMetadataLocked(&device)
-		s.devices[id] = device
 		out = append(out, device)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -181,8 +208,8 @@ func (s *Store) ListDevices() []Device {
 }
 
 func (s *Store) GetDevice(id string) (Device, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	device, ok := s.devices[id]
 	if !ok {
@@ -190,7 +217,6 @@ func (s *Store) GetDevice(id string) (Device, error) {
 	}
 	device.State = stateFor(s.now().UTC(), device.LastSeenAt)
 	s.applyTokenMetadataLocked(&device)
-	s.devices[id] = device
 	return device, nil
 }
 
@@ -221,9 +247,10 @@ func (s *Store) VerifyDeviceToken(deviceID, token string) error {
 	now := s.now().UTC()
 	stored.LastUsedAt = &now
 	s.tokens[deviceID] = stored
-	device.TokenLastUsedAt = &now
-	s.devices[deviceID] = device
-	return s.persistLocked()
+	// Only the token row changes here. Device.TokenLastUsedAt is derived from the
+	// token map on read (applyTokenMetadataLocked), so we don't rewrite the device
+	// on every auth — this keeps high-frequency polling cheap.
+	return s.persistTokenLocked(stored)
 }
 
 func (s *Store) ResetDeviceToken(deviceID string) (DeviceTokenReset, error) {
@@ -247,7 +274,13 @@ func (s *Store) ResetDeviceToken(deviceID string) (DeviceTokenReset, error) {
 	device.UpdatedAt = now
 	s.devices[deviceID] = device
 	s.appendEventLocked("device.token_reset", deviceID, "device token reset", nil)
-	return DeviceTokenReset{DeviceID: deviceID, Token: token, IssuedAt: now}, s.persistLocked()
+	if err := s.persistTokenLocked(s.tokens[deviceID]); err != nil {
+		return DeviceTokenReset{}, err
+	}
+	if err := s.persistDeviceLocked(device); err != nil {
+		return DeviceTokenReset{}, err
+	}
+	return DeviceTokenReset{DeviceID: deviceID, Token: token, IssuedAt: now}, nil
 }
 
 func (s *Store) UpdateDeviceStatus(deviceID string, req UpdateDeviceStatusRequest) (Device, error) {
@@ -269,7 +302,10 @@ func (s *Store) UpdateDeviceStatus(deviceID string, req UpdateDeviceStatusReques
 		message = "device disabled"
 	}
 	s.appendEventLocked(eventType, deviceID, message, nil)
-	return device, s.persistLocked()
+	if err := s.persistDeviceLocked(device); err != nil {
+		return Device{}, err
+	}
+	return device, nil
 }
 
 func (s *Store) AddTelemetry(deviceID string, req TelemetryRequest) (TelemetryPoint, error) {
@@ -293,9 +329,17 @@ func (s *Store) AddTelemetry(deviceID string, req TelemetryRequest) (TelemetryPo
 		Timestamp: now,
 		Metadata:  cloneAnyMap(req.Metadata),
 	}
-	s.telemetry[deviceID] = appendBounded(s.telemetry[deviceID], point, 200)
+	points := s.telemetry[deviceID]
+	prune := len(points) >= telemetryPerDevice
+	s.telemetry[deviceID] = appendBounded(points, point, telemetryPerDevice)
 	s.appendEventLocked("telemetry.received", deviceID, "telemetry received", map[string]any{"key": point.Key, "value": point.Value})
-	return point, s.persistLocked()
+	if err := s.persistTelemetryLocked(point, prune); err != nil {
+		return TelemetryPoint{}, err
+	}
+	if point.Key == "gps.fix" {
+		s.evaluateGeofenceLocked(deviceID, point.Value)
+	}
+	return point, nil
 }
 
 func (s *Store) ListTelemetry(deviceID string, limit int) ([]TelemetryPoint, error) {
@@ -324,8 +368,15 @@ func (s *Store) CreateCommand(deviceID string, req CreateCommandRequest) (Comman
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.devices[deviceID]; !ok {
+	device, ok := s.devices[deviceID]
+	if !ok {
 		return Command{}, ErrNotFound
+	}
+	// Profile enforcement: a device bound to a product profile only accepts the
+	// commands that profile declares. Devices without a profile (infra/bridge
+	// agents such as the serial or Linux agents) accept any command type.
+	if prof, ok := profileForDevice(device); ok && !prof.AllowsCommand(req.Type) {
+		return Command{}, fmt.Errorf("%w: command %q is not allowed by profile %q", ErrBadRequest, req.Type, prof.ID)
 	}
 	now := s.now().UTC()
 	cmd := Command{
@@ -343,7 +394,45 @@ func (s *Store) CreateCommand(deviceID string, req CreateCommandRequest) (Comman
 	}
 	s.commands[cmd.ID] = cmd
 	s.appendEventLocked("command.created", deviceID, "command queued", map[string]any{"commandId": cmd.ID, "type": cmd.Type})
-	return cmd, s.persistLocked()
+	if err := s.persistCommandLocked(cmd); err != nil {
+		return Command{}, err
+	}
+	s.pruneCommandsLocked(deviceID)
+	return cmd, nil
+}
+
+// pruneCommandsLocked caps a device's command history at commandsPerDevice,
+// dropping the oldest terminal commands first. In-flight commands
+// (queued/delivered) are always kept regardless of the cap.
+func (s *Store) pruneCommandsLocked(deviceID string) {
+	type ref struct {
+		id       string
+		created  time.Time
+		terminal bool
+	}
+	refs := make([]ref, 0)
+	for id, c := range s.commands {
+		if c.DeviceID != deviceID {
+			continue
+		}
+		terminal := c.Status == CommandStatusSucceeded || c.Status == CommandStatusFailed || c.Status == CommandStatusExpired
+		refs = append(refs, ref{id: id, created: c.CreatedAt, terminal: terminal})
+	}
+	if len(refs) <= commandsPerDevice {
+		return
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].created.After(refs[j].created) })
+	for _, r := range refs[commandsPerDevice:] {
+		if !r.terminal {
+			continue // never drop in-flight commands
+		}
+		delete(s.commands, r.id)
+		if s.storage == "sqlite" {
+			if _, err := s.db.Exec("DELETE FROM commands WHERE id=?", r.id); err != nil {
+				s.logger.Warn("prune command failed", "error", err, "commandId", r.id)
+			}
+		}
+	}
 }
 
 func (s *Store) ListCommands(deviceID string, limit int) ([]Command, error) {
@@ -354,7 +443,6 @@ func (s *Store) ListCommands(deviceID string, limit int) ([]Command, error) {
 	}
 	now := s.now().UTC()
 	out := []Command{}
-	changed := false
 	for id, cmd := range s.commands {
 		if cmd.DeviceID != deviceID {
 			continue
@@ -364,7 +452,9 @@ func (s *Store) ListCommands(deviceID string, limit int) ([]Command, error) {
 			finished := now
 			cmd.FinishedAt = &finished
 			s.commands[id] = cmd
-			changed = true
+			if err := s.persistCommandLocked(cmd); err != nil {
+				s.logger.Warn("persist expired command failed", "error", err, "commandId", id)
+			}
 		}
 		out = append(out, cmd)
 	}
@@ -373,9 +463,6 @@ func (s *Store) ListCommands(deviceID string, limit int) ([]Command, error) {
 	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
-	}
-	if changed {
-		_ = s.persistLocked()
 	}
 	return out, nil
 }
@@ -397,6 +484,9 @@ func (s *Store) NextCommand(deviceID string) (Command, bool, error) {
 			finished := now
 			cmd.FinishedAt = &finished
 			s.commands[cmd.ID] = cmd
+			if err := s.persistCommandLocked(cmd); err != nil {
+				s.logger.Warn("persist expired command failed", "error", err, "commandId", cmd.ID)
+			}
 			continue
 		}
 		if cmd.Status != CommandStatusQueued {
@@ -408,34 +498,17 @@ func (s *Store) NextCommand(deviceID string) (Command, bool, error) {
 		}
 	}
 	if selected == nil {
-		return Command{}, false, s.persistLocked()
+		return Command{}, false, nil
 	}
 	delivered := now
 	selected.Status = CommandStatusDelivered
 	selected.DeliveredAt = &delivered
 	s.commands[selected.ID] = *selected
 	s.appendEventLocked("command.delivered", deviceID, "command delivered", map[string]any{"commandId": selected.ID, "type": selected.Type})
-	return *selected, true, s.persistLocked()
-}
-
-func (s *Store) AckCommand(commandID string, req AckCommandRequest) (Command, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cmd, ok := s.commands[commandID]
-	if !ok {
-		return Command{}, ErrNotFound
+	if err := s.persistCommandLocked(*selected); err != nil {
+		return Command{}, false, err
 	}
-	if req.Status != CommandStatusSucceeded && req.Status != CommandStatusFailed {
-		return Command{}, fmt.Errorf("%w: status must be succeeded or failed", ErrBadRequest)
-	}
-	now := s.now().UTC()
-	cmd.Status = req.Status
-	cmd.Result = cloneAnyMap(req.Result)
-	cmd.Error = req.Error
-	cmd.FinishedAt = &now
-	s.commands[cmd.ID] = cmd
-	s.appendEventLocked("command.ack", cmd.DeviceID, "command acknowledged", map[string]any{"commandId": cmd.ID, "status": cmd.Status})
-	return cmd, s.persistLocked()
+	return *selected, true, nil
 }
 
 func (s *Store) AckCommandForDevice(deviceID, commandID string, req AckCommandRequest) (Command, error) {
@@ -455,7 +528,10 @@ func (s *Store) AckCommandForDevice(deviceID, commandID string, req AckCommandRe
 	cmd.FinishedAt = &now
 	s.commands[cmd.ID] = cmd
 	s.appendEventLocked("command.ack", cmd.DeviceID, "command acknowledged", map[string]any{"commandId": cmd.ID, "status": cmd.Status})
-	return cmd, s.persistLocked()
+	if err := s.persistCommandLocked(cmd); err != nil {
+		return Command{}, err
+	}
+	return cmd, nil
 }
 
 func (s *Store) ListEvents(limit int) []Event {
@@ -471,6 +547,15 @@ func (s *Store) ListEvents(limit int) []Event {
 	return out
 }
 
+// RecordEvent appends an event from an external source (e.g. the realtime hub)
+// into the gateway event stream. Argument order matches realtime.Hub.OnEvent
+// (deviceID first) so it can be passed directly as the callback.
+func (s *Store) RecordEvent(deviceID, eventType, message string, metadata map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appendEventLocked(eventType, deviceID, message, metadata)
+}
+
 func (s *Store) appendEventLocked(eventType, deviceID, message string, metadata map[string]any) {
 	now := s.now().UTC()
 	event := Event{
@@ -481,64 +566,11 @@ func (s *Store) appendEventLocked(eventType, deviceID, message string, metadata 
 		At:       now,
 		Metadata: cloneAnyMap(metadata),
 	}
-	s.events = appendBounded(s.events, event, 500)
-}
-
-func (s *Store) load() error {
-	if s.storage == "sqlite" {
-		return s.loadSQLite()
+	prune := len(s.events) >= eventBacklog
+	s.events = appendBounded(s.events, event, eventBacklog)
+	if err := s.persistEventLocked(event, prune); err != nil {
+		s.logger.Warn("persist event failed", "error", err, "type", eventType)
 	}
-	bytes, err := os.ReadFile(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	var snap snapshot
-	if err := json.Unmarshal(bytes, &snap); err != nil {
-		return err
-	}
-	if snap.Devices != nil {
-		s.devices = snap.Devices
-	}
-	if snap.Tokens != nil {
-		s.tokens = snap.Tokens
-	}
-	if snap.Telemetry != nil {
-		s.telemetry = snap.Telemetry
-	}
-	if snap.Commands != nil {
-		s.commands = snap.Commands
-	}
-	if snap.Events != nil {
-		s.events = snap.Events
-	}
-	return nil
-}
-
-func (s *Store) persistLocked() error {
-	if s.path == "" {
-		return nil
-	}
-	if s.storage == "sqlite" {
-		return s.persistSQLiteLocked()
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
-	snap := snapshot{
-		Devices:   s.devices,
-		Tokens:    s.tokens,
-		Telemetry: s.telemetry,
-		Commands:  s.commands,
-		Events:    s.events,
-	}
-	bytes, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.path, bytes, 0o644)
 }
 
 func (s *Store) loadSQLite() error {
@@ -568,7 +600,10 @@ func (s *Store) loadSQLite() error {
 	if err := s.loadSQLiteCommands(); err != nil {
 		return err
 	}
-	return s.loadSQLiteEvents()
+	if err := s.loadSQLiteEvents(); err != nil {
+		return err
+	}
+	return s.loadSQLiteFirmware()
 }
 
 func (s *Store) migrateSQLite() error {
@@ -606,6 +641,11 @@ func (s *Store) migrateSQLite() error {
 			data TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_at ON events(at)`,
+		`CREATE TABLE IF NOT EXISTS firmware (
+			id TEXT PRIMARY KEY,
+			data TEXT NOT NULL,
+			blob BLOB NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
@@ -725,100 +765,107 @@ func (s *Store) loadSQLiteEvents() error {
 	return rows.Err()
 }
 
-func (s *Store) persistSQLiteLocked() error {
-	if s.db == nil {
-		return ErrNotFound
+// --- incremental SQLite persistence (replaces the old full-table rewrite) ---
+//
+// Each mutation persists only the rows it touched. This removes the previous
+// "DELETE FROM <all tables> + re-INSERT everything" cost that ran on every
+// single heartbeat/telemetry/command write, which was the main scalability
+// bottleneck (especially for high-frequency GPS telemetry).
+
+func (s *Store) persistDeviceLocked(d Device) error {
+	if s.storage != "sqlite" {
+		return nil
 	}
-	tx, err := s.db.Begin()
+	raw, err := json.Marshal(d)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	for _, statement := range []string{
-		"DELETE FROM devices",
-		"DELETE FROM device_tokens",
-		"DELETE FROM telemetry",
-		"DELETE FROM commands",
-		"DELETE FROM events",
-	} {
-		if _, err := tx.Exec(statement); err != nil {
-			return err
-		}
+	_, err = s.db.Exec(
+		`INSERT INTO devices(id, data) VALUES(?, ?)
+		 ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
+		d.ID, string(raw))
+	return err
+}
+
+func (s *Store) persistTokenLocked(t DeviceToken) error {
+	if s.storage != "sqlite" {
+		return nil
 	}
-	for _, device := range s.devices {
-		raw, err := json.Marshal(device)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec("INSERT INTO devices(id, data) VALUES(?, ?)", device.ID, string(raw)); err != nil {
-			return err
-		}
+	var lastUsed any
+	if t.LastUsedAt != nil {
+		lastUsed = t.LastUsedAt.Format(time.RFC3339Nano)
 	}
-	for _, token := range s.tokens {
-		var lastUsed any
-		if token.LastUsedAt != nil {
-			lastUsed = token.LastUsedAt.Format(time.RFC3339Nano)
-		}
-		if _, err := tx.Exec(
-			"INSERT INTO device_tokens(device_id, token_hash, created_at, last_used_at) VALUES(?, ?, ?, ?)",
-			token.DeviceID,
-			token.TokenHash,
-			token.CreatedAt.Format(time.RFC3339Nano),
-			lastUsed,
-		); err != nil {
-			return err
-		}
+	_, err := s.db.Exec(
+		`INSERT INTO device_tokens(device_id, token_hash, created_at, last_used_at) VALUES(?, ?, ?, ?)
+		 ON CONFLICT(device_id) DO UPDATE SET token_hash=excluded.token_hash, created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
+		t.DeviceID, t.TokenHash, t.CreatedAt.Format(time.RFC3339Nano), lastUsed)
+	return err
+}
+
+func (s *Store) persistCommandLocked(c Command) error {
+	if s.storage != "sqlite" {
+		return nil
 	}
-	for _, points := range s.telemetry {
-		for _, point := range points {
-			raw, err := json.Marshal(point)
-			if err != nil {
-				return err
-			}
-			if _, err := tx.Exec(
-				"INSERT INTO telemetry(id, device_id, timestamp, data) VALUES(?, ?, ?, ?)",
-				point.ID,
-				point.DeviceID,
-				point.Timestamp.Format(time.RFC3339Nano),
-				string(raw),
-			); err != nil {
-				return err
-			}
-		}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return err
 	}
-	for _, command := range s.commands {
-		raw, err := json.Marshal(command)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			"INSERT INTO commands(id, device_id, status, created_at, data) VALUES(?, ?, ?, ?, ?)",
-			command.ID,
-			command.DeviceID,
-			string(command.Status),
-			command.CreatedAt.Format(time.RFC3339Nano),
-			string(raw),
-		); err != nil {
-			return err
-		}
+	_, err = s.db.Exec(
+		`INSERT INTO commands(id, device_id, status, created_at, data) VALUES(?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET status=excluded.status, data=excluded.data`,
+		c.ID, c.DeviceID, string(c.Status), c.CreatedAt.Format(time.RFC3339Nano), string(raw))
+	return err
+}
+
+func (s *Store) persistTelemetryLocked(p TelemetryPoint, prune bool) error {
+	if s.storage != "sqlite" {
+		return nil
 	}
-	for _, event := range s.events {
-		raw, err := json.Marshal(event)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			"INSERT INTO events(id, device_id, type, at, data) VALUES(?, ?, ?, ?, ?)",
-			event.ID,
-			event.DeviceID,
-			event.Type,
-			event.At.Format(time.RFC3339Nano),
-			string(raw),
-		); err != nil {
-			return err
-		}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return err
 	}
-	return tx.Commit()
+	if _, err := s.db.Exec(
+		`INSERT INTO telemetry(id, device_id, timestamp, data) VALUES(?, ?, ?, ?)`,
+		p.ID, p.DeviceID, p.Timestamp.Format(time.RFC3339Nano), string(raw)); err != nil {
+		return err
+	}
+	if !prune {
+		return nil
+	}
+	// Rolling cleanup: keep only the newest telemetryPerDevice rows per device.
+	// Ordering by id (which encodes the creation UnixNano, fixed width) is a
+	// deterministic monotonic key, unlike RFC3339Nano timestamp strings.
+	_, err = s.db.Exec(
+		`DELETE FROM telemetry WHERE device_id=? AND id NOT IN (
+			SELECT id FROM telemetry WHERE device_id=? ORDER BY id DESC LIMIT ?)`,
+		p.DeviceID, p.DeviceID, telemetryPerDevice)
+	return err
+}
+
+func (s *Store) persistEventLocked(e Event, prune bool) error {
+	if s.storage != "sqlite" {
+		return nil
+	}
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO events(id, device_id, type, at, data) VALUES(?, ?, ?, ?, ?)`,
+		e.ID, e.DeviceID, e.Type, e.At.Format(time.RFC3339Nano), string(raw)); err != nil {
+		return err
+	}
+	if !prune {
+		return nil
+	}
+	// Rolling cleanup: keep only the newest eventBacklog events globally.
+	// id encodes the creation UnixNano (fixed width) -> deterministic ordering.
+	_, err = s.db.Exec(
+		`DELETE FROM events WHERE id NOT IN (
+			SELECT id FROM events ORDER BY id DESC LIMIT ?)`,
+		eventBacklog)
+	return err
 }
 
 func stateFor(now, lastSeen time.Time) OnlineState {

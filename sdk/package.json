@@ -1,0 +1,15 @@
+{
+  "name": "@light-gateway/sdk",
+  "version": "0.1.0",
+  "description": "Framework-agnostic TypeScript SDK for the Light Gateway (functional API, device provisioning, realtime voice). Works in browser, Node 18+, React Native and Electron.",
+  "type": "commonjs",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js"
+  },
+  "files": ["dist/src"],
+  "license": "MIT"
+}

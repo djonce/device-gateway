@@ -1,11 +1,17 @@
 import {
 	Activity,
 	CheckCircle2,
+	Clock,
+	CloudSun,
 	Copy,
 	Cpu,
 	History,
 	KeyRound,
+	Lightbulb,
 	Loader2,
+	LogOut,
+	MapPin,
+	Mic,
 	Play,
 	Plus,
 	Power,
@@ -15,23 +21,41 @@ import {
 	ShieldOff,
 	Smartphone,
 	Terminal,
+	UploadCloud,
 } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import {
+	ClockContent,
 	Command,
 	Device,
+	Firmware,
 	GatewayEvent,
+	Geofence,
 	RegisterDeviceInput,
 	TelemetryPoint,
+	TrackPoint,
+	authStatus,
 	createCommand,
+	getClockContent,
+	getRealtimeStatus,
+	getToken,
+	getTrack,
   listCommands,
   listDevices,
 	listEvents,
+	listFirmware,
 	listTelemetry,
+	login,
+	logout,
 	registerDemoDevice,
 	resetDeviceToken,
+	rolloutFirmware,
+	sayToDevice,
+	setGeofence,
+	setOtaTarget,
 	updateDeviceStatus,
+	uploadFirmware,
 } from '@/services/api';
 
 type TableRow = {
@@ -59,6 +83,43 @@ const typeIcons: Record<Device['type'], typeof Activity> = {
 
 const demoDevices: RegisterDeviceInput[] = [
   {
+    id: 'esp-nightlight-001',
+    name: 'Bedroom Night Light',
+    type: 'esp' as const,
+    category: 'light' as const,
+    model: 'esp32-rgb-strip',
+    agentVersion: 'esp32-light/0.1.0',
+    labels: { room: 'bedroom', transport: 'wifi' },
+  },
+  {
+    id: 'esp-deskclock-001',
+    name: 'Desk Weather Clock',
+    type: 'esp' as const,
+    category: 'clock' as const,
+    model: 'esp32-clock-weather',
+    agentVersion: 'esp32-clock/0.1.0',
+    labels: { room: 'study', transport: 'wifi', lat: '31.2304', lon: '121.4737' },
+    metadata: { tz: 'Asia/Shanghai' },
+  },
+  {
+    id: 'esp-tracker-001',
+    name: 'Asset GPS Tracker',
+    type: 'esp' as const,
+    category: 'gps' as const,
+    model: 'esp32-neo6m',
+    agentVersion: 'esp32-gps/0.1.0',
+    labels: { asset: 'van-7', transport: 'wifi' },
+  },
+  {
+    id: 'esp-xiaozhi-001',
+    name: 'XiaoZhi Voice Assistant',
+    type: 'esp' as const,
+    category: 'voice' as const,
+    model: 'esp32-s3-xiaozhi',
+    agentVersion: 'esp32-voice/0.1.0',
+    labels: { room: 'study', transport: 'wifi' },
+  },
+  {
     id: 'esp-livingroom-001',
     name: 'Living Room ESP',
     type: 'esp' as const,
@@ -85,6 +146,12 @@ const demoDevices: RegisterDeviceInput[] = [
 ];
 
 export default function HomePage() {
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authed, setAuthed] = useState(false);
+  const [loginUser, setLoginUser] = useState('admin');
+  const [loginPass, setLoginPass] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [loggingIn, setLoggingIn] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedId, setSelectedId] = useState<string>('');
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
@@ -146,12 +213,36 @@ export default function HomePage() {
       }
       setLastUpdatedAt(new Date().toISOString());
     } catch (err) {
+      if (err instanceof Error && err.message === 'UNAUTHORIZED') {
+        setAuthed(false);
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       if (!options.silent) {
         setLoading(false);
       }
     }
+  }
+
+  async function submitLogin(event: React.FormEvent) {
+    event.preventDefault();
+    setLoginError('');
+    setLoggingIn(true);
+    try {
+      await login(loginUser, loginPass);
+      setAuthed(true);
+    } catch {
+      setLoginError('用户名或密码错误');
+    } finally {
+      setLoggingIn(false);
+    }
+  }
+
+  async function doLogout() {
+    await logout();
+    setAuthed(false);
+    setLoginPass('');
   }
 
   async function seedDemoDevices() {
@@ -180,6 +271,22 @@ export default function HomePage() {
       await createCommand(selected.id, { type: commandType, payload: parsedPayload, ttlSeconds: 300 });
       await refresh(selected.id);
       setNotice(`${commandType} queued for ${selected.name}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Command failed');
+    } finally {
+      setActionBusy('');
+    }
+  }
+
+  async function sendDeviceCommand(type: string, payload: Record<string, unknown>) {
+    if (!selected) return;
+    setError('');
+    setNotice('');
+    setActionBusy('cmd');
+    try {
+      await createCommand(selected.id, { type, payload, ttlSeconds: 120 });
+      await refresh(selected.id);
+      setNotice(`${type} 已下发给 ${selected.name}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Command failed');
     } finally {
@@ -232,18 +339,61 @@ export default function HomePage() {
   }
 
   useEffect(() => {
-    refresh();
+    authStatus()
+      .then((status) => {
+        setAuthRequired(status.authRequired);
+        if (!status.authRequired || getToken()) setAuthed(true);
+      })
+      .catch(() => {
+        setAuthRequired(false);
+        setAuthed(true);
+      });
   }, []);
 
   useEffect(() => {
-    if (!autoRefresh) return undefined;
+    if (authed) refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authed]);
+
+  useEffect(() => {
+    if (!authed || !autoRefresh) return undefined;
     const timer = window.setInterval(() => refresh(selectedId, { silent: true }), 8000);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, selectedId]);
+  }, [authed, autoRefresh, selectedId]);
 
   useEffect(() => {
     setLastToken('');
   }, [selected?.id]);
+
+  if (authRequired && !authed) {
+    return (
+      <main className="loginShell" style={{ display: 'grid', placeItems: 'center', minHeight: '100vh' }}>
+        <form className="panel" style={{ width: 320, padding: 24 }} onSubmit={submitLogin}>
+          <PanelTitle icon={<KeyRound size={18} />} title="管理后台登录" />
+          <div className="formGrid">
+            <label>
+              用户名
+              <input value={loginUser} onChange={(event) => setLoginUser(event.target.value)} autoComplete="username" />
+            </label>
+            <label>
+              密码
+              <input
+                type="password"
+                value={loginPass}
+                onChange={(event) => setLoginPass(event.target.value)}
+                autoComplete="current-password"
+              />
+            </label>
+            <button type="submit" className="primaryButton" disabled={loggingIn}>
+              {loggingIn ? <Loader2 size={16} className="spin" /> : <KeyRound size={16} />}
+              登录
+            </button>
+            {loginError && <span className="fieldError">{loginError}</span>}
+          </div>
+        </form>
+      </main>
+    );
+  }
 
   return (
     <main className="shell">
@@ -272,6 +422,11 @@ export default function HomePage() {
             <Plus size={16} />
             Seed Demo
           </button>
+          {authRequired && (
+            <button type="button" className="iconButton" onClick={doLogout} title="退出登录">
+              <LogOut size={18} />
+            </button>
+          )}
         </div>
 
         <div className="deviceList">
@@ -326,6 +481,19 @@ export default function HomePage() {
 
         {selected ? (
           <div className="contentGrid">
+            {selected.category === 'light' && (
+              <LightPanel disabled={selected.disabled} busy={actionBusy === 'cmd'} onSend={sendDeviceCommand} />
+            )}
+            {selected.category === 'clock' && (
+              <ClockPanel device={selected} busy={actionBusy === 'cmd'} onSend={sendDeviceCommand} />
+            )}
+            {selected.category === 'gps' && (
+              <GpsPanel device={selected} busy={actionBusy === 'cmd'} onSend={sendDeviceCommand} />
+            )}
+            {selected.category === 'voice' && (
+              <VoicePanel device={selected} busy={actionBusy === 'cmd'} onSend={sendDeviceCommand} />
+            )}
+            {selected.category && <OtaPanel device={selected} onChanged={() => refresh(selected.id)} />}
             <section className="panel devicePanel">
               <PanelTitle icon={<Activity size={18} />} title="Device Profile" />
               <dl className="details">
@@ -493,6 +661,637 @@ export default function HomePage() {
         )}
       </section>
     </main>
+  );
+}
+
+function LightPanel({
+  disabled,
+  busy,
+  onSend,
+}: {
+  disabled: boolean;
+  busy: boolean;
+  onSend: (type: string, payload: Record<string, unknown>) => void;
+}) {
+  const [on, setOn] = useState(true);
+  const [brightness, setBrightness] = useState(80);
+  const [color, setColor] = useState('#ffd9a0');
+  const [effect, setEffect] = useState('static');
+  const [speed, setSpeed] = useState(5);
+  const [scheduleOn, setScheduleOn] = useState('22:00');
+  const [scheduleOff, setScheduleOff] = useState('07:00');
+  const locked = disabled || busy;
+
+  function togglePower() {
+    const next = !on;
+    setOn(next);
+    onSend('light.power', { on: next });
+  }
+
+  return (
+    <section className="panel commandPanel">
+      <PanelTitle icon={<Lightbulb size={18} />} title="灯光控制" />
+      <div className="formGrid">
+        <div className="formMeta">
+          <button type="button" className="primaryButton" onClick={togglePower} disabled={locked}>
+            <Power size={16} />
+            {on ? '关灯' : '开灯'}
+          </button>
+          <span
+            title={color}
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: 8,
+              border: '1px solid rgba(0,0,0,0.15)',
+              background: on ? color : '#1b2330',
+              opacity: on ? Math.max(0.25, brightness / 100) : 1,
+            }}
+          />
+        </div>
+
+        <label>
+          亮度 · {brightness}%
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={brightness}
+            onChange={(event) => setBrightness(Number(event.target.value))}
+            onMouseUp={() => onSend('light.brightness', { value: brightness })}
+            onTouchEnd={() => onSend('light.brightness', { value: brightness })}
+            disabled={locked}
+          />
+        </label>
+
+        <label>
+          颜色
+          <input
+            type="color"
+            value={color}
+            onChange={(event) => setColor(event.target.value)}
+            onBlur={() => onSend('light.color', { hex: color })}
+            disabled={locked}
+          />
+        </label>
+
+        <label>
+          灯效
+          <select value={effect} onChange={(event) => setEffect(event.target.value)} disabled={locked}>
+            <option value="static">静态</option>
+            <option value="breath">呼吸</option>
+            <option value="rainbow">彩虹</option>
+          </select>
+        </label>
+
+        <label>
+          灯效速度 · {speed}
+          <input
+            type="range"
+            min={1}
+            max={10}
+            value={speed}
+            onChange={(event) => setSpeed(Number(event.target.value))}
+            disabled={locked}
+          />
+        </label>
+        <button
+          type="button"
+          className="textButton"
+          onClick={() => onSend('light.effect', { name: effect, speed })}
+          disabled={locked}
+        >
+          <Send size={16} />
+          应用灯效
+        </button>
+
+        <div className="formMeta">
+          <label className="switchLabel">
+            定时开
+            <input type="time" value={scheduleOn} onChange={(event) => setScheduleOn(event.target.value)} disabled={locked} />
+          </label>
+          <label className="switchLabel">
+            定时关
+            <input type="time" value={scheduleOff} onChange={(event) => setScheduleOff(event.target.value)} disabled={locked} />
+          </label>
+        </div>
+        <button
+          type="button"
+          className="textButton"
+          onClick={() => onSend('light.schedule', { on: scheduleOn, off: scheduleOff })}
+          disabled={locked}
+        >
+          <Send size={16} />
+          保存定时
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function ClockPanel({
+  device,
+  busy,
+  onSend,
+}: {
+  device: Device;
+  busy: boolean;
+  onSend: (type: string, payload: Record<string, unknown>) => void;
+}) {
+  const [mode, setMode] = useState('clock');
+  const [brightness, setBrightness] = useState(80);
+  const [lat, setLat] = useState(device.labels?.lat ?? '31.2304');
+  const [lon, setLon] = useState(device.labels?.lon ?? '121.4737');
+  const [tz, setTz] = useState((device.metadata?.tz as string) ?? 'Asia/Shanghai');
+  const [preview, setPreview] = useState<ClockContent | null>(null);
+  const [localError, setLocalError] = useState('');
+  const [fetching, setFetching] = useState(false);
+  const locked = device.disabled || busy;
+
+  function pickMode(next: string) {
+    setMode(next);
+    onSend('display.mode', { mode: next });
+  }
+
+  async function refreshAndPush() {
+    setLocalError('');
+    setFetching(true);
+    try {
+      const content = await getClockContent(Number(lat), Number(lon), tz);
+      setPreview(content);
+      onSend('time.sync', { epoch: content.time.epoch, tz });
+      if (content.weather) {
+        onSend('weather.push', { temp: content.weather.tempC, cond: content.weather.text });
+      }
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : '获取天气失败');
+    } finally {
+      setFetching(false);
+    }
+  }
+
+  return (
+    <section className="panel commandPanel">
+      <PanelTitle icon={<Clock size={18} />} title="时钟 / 天气屏" />
+      <div className="formGrid">
+        <div className="formMeta">
+          {['clock', 'calendar', 'weather'].map((value) => (
+            <button
+              key={value}
+              type="button"
+              className={value === mode ? 'primaryButton' : 'textButton'}
+              onClick={() => pickMode(value)}
+              disabled={locked}
+            >
+              {value === 'clock' ? '时钟' : value === 'calendar' ? '日历' : '天气'}
+            </button>
+          ))}
+        </div>
+
+        <label>
+          屏幕亮度 · {brightness}%
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={brightness}
+            onChange={(event) => setBrightness(Number(event.target.value))}
+            onMouseUp={() => onSend('display.brightness', { value: brightness })}
+            onTouchEnd={() => onSend('display.brightness', { value: brightness })}
+            disabled={locked}
+          />
+        </label>
+
+        <div className="formMeta">
+          <label className="switchLabel">
+            纬度
+            <input value={lat} onChange={(event) => setLat(event.target.value)} disabled={locked} />
+          </label>
+          <label className="switchLabel">
+            经度
+            <input value={lon} onChange={(event) => setLon(event.target.value)} disabled={locked} />
+          </label>
+        </div>
+        <label>
+          时区 (IANA)
+          <input value={tz} onChange={(event) => setTz(event.target.value)} disabled={locked} />
+        </label>
+
+        <button type="button" className="primaryButton" onClick={refreshAndPush} disabled={locked || fetching}>
+          {fetching ? <Loader2 size={16} className="spin" /> : <CloudSun size={16} />}
+          {fetching ? '获取中...' : '获取天气并推送到屏幕'}
+        </button>
+
+        {localError && <span className="fieldError">{localError}</span>}
+        {preview && (
+          <div className="formMeta">
+            <span>
+              {preview.weather
+                ? `${preview.weather.text} ${preview.weather.tempC.toFixed(1)}°C · 湿度 ${preview.weather.humidity}%`
+                : `天气不可用${preview.weatherError ? `（${preview.weatherError}）` : ''}`}
+            </span>
+            <span>{formatTime(preview.time.iso)}</span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+type ScreenPt = { x: number; y: number };
+type MapGeo = {
+  empty: boolean;
+  points: ScreenPt[];
+  polyline: string;
+  last: ScreenPt | null;
+  fenceCircle: { cx: number; cy: number; r: number } | null;
+};
+
+// buildMap projects track points + geofence into an SVG viewBox using a simple
+// equirectangular projection (x scaled by cos(lat)), so the geofence renders as
+// a true circle. No external map library needed.
+function buildMap(track: TrackPoint[], fence?: Geofence): MapGeo {
+  const W = 320;
+  const H = 220;
+  const pad = 18;
+  const blank: MapGeo = { empty: true, points: [], polyline: '', last: null, fenceCircle: null };
+  if (track.length === 0 && !fence) return blank;
+
+  const refLat = fence?.centerLat ?? track[0]?.lat ?? 0;
+  const cosMid = Math.cos((refLat * Math.PI) / 180) || 1;
+  const proj = (lat: number, lng: number): ScreenPt => ({ x: lng * cosMid, y: lat });
+
+  const projected = track.map((p) => proj(p.lat, p.lng));
+  const bounds = [...projected];
+  const rDeg = fence ? fence.radiusM / 111320 : 0;
+  if (fence) {
+    const c = proj(fence.centerLat, fence.centerLng);
+    bounds.push({ x: c.x - rDeg, y: c.y - rDeg }, { x: c.x + rDeg, y: c.y + rDeg });
+  }
+
+  const minX = Math.min(...bounds.map((p) => p.x));
+  const maxX = Math.max(...bounds.map((p) => p.x));
+  const minY = Math.min(...bounds.map((p) => p.y));
+  const maxY = Math.max(...bounds.map((p) => p.y));
+  const spanX = maxX - minX || 1e-6;
+  const spanY = maxY - minY || 1e-6;
+  const scale = Math.min((W - 2 * pad) / spanX, (H - 2 * pad) / spanY);
+  const offX = (W - spanX * scale) / 2;
+  const offY = (H - spanY * scale) / 2;
+  const toScreen = (p: ScreenPt): ScreenPt => ({ x: offX + (p.x - minX) * scale, y: H - (offY + (p.y - minY) * scale) });
+
+  const screenPts = projected.map(toScreen);
+  let fenceCircle: MapGeo['fenceCircle'] = null;
+  if (fence) {
+    const c = toScreen(proj(fence.centerLat, fence.centerLng));
+    fenceCircle = { cx: c.x, cy: c.y, r: rDeg * scale };
+  }
+  return {
+    empty: false,
+    points: screenPts,
+    polyline: screenPts.length > 1 ? screenPts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') : '',
+    last: screenPts.length ? screenPts[screenPts.length - 1] : null,
+    fenceCircle,
+  };
+}
+
+function GpsPanel({
+  device,
+  busy,
+  onSend,
+}: {
+  device: Device;
+  busy: boolean;
+  onSend: (type: string, payload: Record<string, unknown>) => void;
+}) {
+  const [track, setTrack] = useState<TrackPoint[]>([]);
+  const [intervalSec, setIntervalSec] = useState(10);
+  const [centerLat, setCenterLat] = useState(device.geofence?.centerLat?.toString() ?? '');
+  const [centerLng, setCenterLng] = useState(device.geofence?.centerLng?.toString() ?? '');
+  const [radiusM, setRadiusM] = useState(device.geofence?.radiusM?.toString() ?? '300');
+  const [localError, setLocalError] = useState('');
+  const [savingFence, setSavingFence] = useState(false);
+  const locked = device.disabled || busy;
+
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      try {
+        const response = await getTrack(device.id, 200);
+        if (alive) setTrack(response.items);
+      } catch {
+        /* track unavailable; keep last */
+      }
+    }
+    load();
+    const timer = window.setInterval(load, 8000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [device.id]);
+
+  const latest = track.length ? track[track.length - 1] : null;
+  const geo = useMemo(() => buildMap(track, device.geofence), [track, device.geofence]);
+
+  async function saveFence() {
+    setLocalError('');
+    const lat = Number(centerLat);
+    const lng = Number(centerLng);
+    const r = Number(radiusM);
+    if (!centerLat || !centerLng || !(r > 0)) {
+      setLocalError('请填写中心经纬度和半径(米)');
+      return;
+    }
+    setSavingFence(true);
+    try {
+      await setGeofence(device.id, { centerLat: lat, centerLng: lng, radiusM: r });
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : '设置围栏失败');
+    } finally {
+      setSavingFence(false);
+    }
+  }
+
+  function useLatestAsCenter() {
+    if (latest) {
+      setCenterLat(latest.lat.toFixed(6));
+      setCenterLng(latest.lng.toFixed(6));
+    }
+  }
+
+  return (
+    <section className="panel commandPanel">
+      <PanelTitle icon={<MapPin size={18} />} title="GPS 定位 / 轨迹" />
+      <div className="formGrid">
+        <svg viewBox="0 0 320 220" style={{ width: '100%', background: '#0e1622', borderRadius: 8 }}>
+          {geo.fenceCircle && (
+            <circle
+              cx={geo.fenceCircle.cx}
+              cy={geo.fenceCircle.cy}
+              r={geo.fenceCircle.r}
+              fill="rgba(20,100,244,0.15)"
+              stroke="#1464f4"
+              strokeDasharray="4 3"
+            />
+          )}
+          {geo.polyline && <polyline points={geo.polyline} fill="none" stroke="#3ad1a8" strokeWidth={2} />}
+          {geo.points.map((p, index) => (
+            <circle key={index} cx={p.x} cy={p.y} r={1.6} fill="#3ad1a8" opacity={0.6} />
+          ))}
+          {geo.last && <circle cx={geo.last.x} cy={geo.last.y} r={4} fill="#ffd9a0" stroke="#1c2331" />}
+          {geo.empty && (
+            <text x={160} y={110} fill="#5f6b7d" fontSize={12} textAnchor="middle">
+              暂无轨迹
+            </text>
+          )}
+        </svg>
+
+        <div className="formMeta">
+          <span>{latest ? `位置 ${latest.lat.toFixed(5)}, ${latest.lng.toFixed(5)}` : '等待定位...'}</span>
+          <span className={device.geofenceState === 'outside' ? 'fieldError' : ''}>围栏 {device.geofenceState || '未知'}</span>
+        </div>
+
+        <label>
+          上报频率 · {intervalSec}s
+          <input
+            type="range"
+            min={1}
+            max={60}
+            value={intervalSec}
+            onChange={(event) => setIntervalSec(Number(event.target.value))}
+            onMouseUp={() => onSend('gps.interval', { seconds: intervalSec })}
+            onTouchEnd={() => onSend('gps.interval', { seconds: intervalSec })}
+            disabled={locked}
+          />
+        </label>
+
+        <div className="formMeta">
+          <label className="switchLabel">
+            中心纬度
+            <input value={centerLat} onChange={(event) => setCenterLat(event.target.value)} disabled={locked} />
+          </label>
+          <label className="switchLabel">
+            中心经度
+            <input value={centerLng} onChange={(event) => setCenterLng(event.target.value)} disabled={locked} />
+          </label>
+        </div>
+        <label>
+          围栏半径 (米)
+          <input value={radiusM} onChange={(event) => setRadiusM(event.target.value)} disabled={locked} />
+        </label>
+        <div className="formMeta">
+          <button type="button" className="textButton" onClick={useLatestAsCenter} disabled={locked || !latest}>
+            用当前位置
+          </button>
+          <button type="button" className="primaryButton" onClick={saveFence} disabled={locked || savingFence}>
+            {savingFence ? <Loader2 size={16} className="spin" /> : <MapPin size={16} />}
+            保存围栏
+          </button>
+        </div>
+        {localError && <span className="fieldError">{localError}</span>}
+      </div>
+    </section>
+  );
+}
+
+function VoicePanel({
+  device,
+  busy,
+  onSend,
+}: {
+  device: Device;
+  busy: boolean;
+  onSend: (type: string, payload: Record<string, unknown>) => void;
+}) {
+  const [connected, setConnected] = useState(false);
+  const [text, setText] = useState('晚安');
+  const [wake, setWake] = useState(true);
+  const [localError, setLocalError] = useState('');
+  const [sending, setSending] = useState(false);
+  const locked = device.disabled || busy;
+
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      try {
+        const status = await getRealtimeStatus(device.id);
+        if (alive) setConnected(status.connected);
+      } catch {
+        /* status unavailable */
+      }
+    }
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [device.id]);
+
+  async function say() {
+    setLocalError('');
+    setSending(true);
+    try {
+      await sayToDevice(device.id, text);
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : '推送失败');
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function toggleWake() {
+    const next = !wake;
+    setWake(next);
+    onSend('voice.wake', { enabled: next });
+  }
+
+  return (
+    <section className="panel commandPanel">
+      <PanelTitle icon={<Mic size={18} />} title="小智 / 语音" />
+      <div className="formGrid">
+        <div className="formMeta">
+          <span className={connected ? '' : 'fieldError'}>
+            实时通道 {connected ? '已连接' : '未连接'}
+          </span>
+          <span>WebSocket {`/api/v1/devices/${device.id}/ws`}</span>
+        </div>
+
+        <label>
+          让设备播报 (tts.say)
+          <input value={text} onChange={(event) => setText(event.target.value)} disabled={locked} />
+        </label>
+        <button type="button" className="primaryButton" onClick={say} disabled={locked || sending || !connected}>
+          {sending ? <Loader2 size={16} className="spin" /> : <Mic size={16} />}
+          {connected ? '推送播报' : '设备未连接'}
+        </button>
+
+        <div className="formMeta">
+          <label className="switchLabel">
+            <input type="checkbox" checked={wake} onChange={toggleWake} disabled={locked} />
+            <span>唤醒 (voice.wake)</span>
+          </label>
+        </div>
+
+        {localError && <span className="fieldError">{localError}</span>}
+        <span className="fieldHint">
+          占位语音管线：实时通道与 hello/text.input/tts.say 协议已通；真实 ASR/TTS/LLM 与设备端音频固件为后续单独迭代。
+        </span>
+      </div>
+    </section>
+  );
+}
+
+function OtaPanel({ device, onChanged }: { device: Device; onChanged: () => void }) {
+  const [firmwares, setFirmwares] = useState<Firmware[]>([]);
+  const [version, setVersion] = useState('');
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState('');
+  const [localError, setLocalError] = useState('');
+
+  async function reload() {
+    try {
+      const res = await listFirmware(device.category || undefined);
+      setFirmwares(res.items);
+    } catch {
+      /* ignore */
+    }
+  }
+  useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [device.category]);
+
+  const upToDate = Boolean(device.fwVersion && device.targetFwVersion && device.fwVersion === device.targetFwVersion);
+
+  async function doUpload() {
+    if (!file || !version.trim() || !device.category) {
+      setLocalError('需要选择固件文件并填写版本号');
+      return;
+    }
+    setLocalError('');
+    setBusy('upload');
+    try {
+      await uploadFirmware({ category: device.category, model: device.model, version: version.trim() }, file);
+      setVersion('');
+      setFile(null);
+      await reload();
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : '上传失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function applyTarget(v: string) {
+    setLocalError('');
+    setBusy('target');
+    try {
+      await setOtaTarget(device.id, v);
+      onChanged();
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : '设置目标失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function doRollout(id: string) {
+    setLocalError('');
+    setBusy('rollout');
+    try {
+      await rolloutFirmware(id);
+      onChanged();
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : '灰度失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  return (
+    <section className="panel">
+      <PanelTitle icon={<UploadCloud size={18} />} title="固件 / OTA" />
+      <div className="formGrid">
+        <div className="formMeta">
+          <span>当前版本 {device.fwVersion || '未知'}</span>
+          <span className={device.targetFwVersion && !upToDate ? 'fieldError' : ''}>
+            目标 {device.targetFwVersion || '未设置'}
+            {device.targetFwVersion ? (upToDate ? '（已最新）' : '（待更新）') : ''}
+          </span>
+        </div>
+
+        {firmwares.length === 0 && <span className="fieldHint">该类别（{device.category}）暂无固件，先上传。</span>}
+        {firmwares.map((fw) => (
+          <div key={fw.id} className="formMeta">
+            <span>
+              {fw.version} · {(fw.size / 1024).toFixed(0)}KB · {fw.sha256.slice(0, 8)}
+            </span>
+            <span>
+              <button type="button" className="linkButton" disabled={Boolean(busy)} onClick={() => applyTarget(fw.version)}>
+                设为目标
+              </button>
+              {' · '}
+              <button type="button" className="linkButton" disabled={Boolean(busy)} onClick={() => doRollout(fw.id)}>
+                灰度本类
+              </button>
+            </span>
+          </div>
+        ))}
+
+        <label>
+          新版本号
+          <input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="如 1.2.0" />
+        </label>
+        <input type="file" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+        <button type="button" className="primaryButton" onClick={doUpload} disabled={busy === 'upload'}>
+          {busy === 'upload' ? <Loader2 size={16} className="spin" /> : <UploadCloud size={16} />}
+          上传固件（{device.category}）
+        </button>
+        {localError && <span className="fieldError">{localError}</span>}
+      </div>
+    </section>
   );
 }
 

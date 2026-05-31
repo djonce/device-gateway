@@ -131,6 +131,91 @@ http://192.168.3.109:7001
 
 配置保存后，开发板会重启并以 `esp32-<chip-id>` 注册到网关。
 
+## ESP32 小夜灯 / RGB 灯带固件（category=light）
+
+面向具体产品的固件，注册为 `light` 类别并绑定 `light.v1` 能力档案，实现 `light.*` 命令（开关、亮度、颜色、灯效、定时）。
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 firmware/esp32-light
+arduino-cli upload  --fqbn esp32:esp32:esp32 --port /dev/cu.wchusbserial110 firmware/esp32-light
+```
+
+详见 [firmware/esp32-light/README.md](firmware/esp32-light/README.md)。在管理台选中该设备会显示「灯光控制」面板，可直接开关、调色、调亮度、切灯效、设定时。
+
+## ESP32 时钟 / 天气屏固件（category=clock）
+
+注册为 `clock` 类别（profile `clock.v1`）。时间与天气走网关内容接口 `GET /api/v1/content/clock?lat&lon&tz`，由网关代理 [Open-Meteo](https://open-meteo.com)（免费、无需 API key，密钥不下发到设备），设备定时拉取；控制台也可即时下发 `time.sync` / `weather.push` 命令刷新。
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 firmware/esp32-clock
+arduino-cli upload  --fqbn esp32:esp32:esp32 --port /dev/cu.wchusbserial110 firmware/esp32-clock
+```
+
+详见 [firmware/esp32-clock/README.md](firmware/esp32-clock/README.md)。管理台选中该设备显示「时钟 / 天气屏」面板：切换显示模式、调屏幕亮度、按经纬度获取天气并推送。
+
+## ESP32 GPS 追踪器固件（category=gps）
+
+注册为 `gps` 类别（profile `gps.v1`）。从 UART GPS 模块读 NMEA 上报 `gps.fix` 遥测。**地理围栏进出判定在网关侧**：设备上报位置后，网关用 haversine 算距离判断是否在围栏内，跨越边界产生 `geofence.enter` / `geofence.exit` 事件。
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 firmware/esp32-gps
+arduino-cli upload  --fqbn esp32:esp32:esp32 --port /dev/cu.wchusbserial110 firmware/esp32-gps
+```
+
+相关接口：`GET /api/v1/devices/{id}/track?limit=N` 查询轨迹，`POST /api/v1/devices/{id}/geofence`（body `{centerLat,centerLng,radiusM}`）设置围栏（同时下发 `geofence.set` 命令）。详见 [firmware/esp32-gps/README.md](firmware/esp32-gps/README.md)。管理台选中该设备显示「GPS 定位 / 轨迹」面板：轻量 SVG 轨迹图 + 围栏圈、实时位置与围栏状态、调上报频率、设围栏。
+
+## 实时通道 / 语音（小智）
+
+语音设备走 WebSocket 实时通道（`internal/realtime`，标准库自实现，无外部依赖），而非命令长轮询。设备建连 `GET /api/v1/devices/{id}/ws`（设备 Token 鉴权），收发 JSON 信封协议。
+
+对话/转写/合成由**可插拔管线**决定：默认回显占位；配置环境变量后接真实 LLM/ASR/TTS（OpenAI 兼容 `chat/completions` + 可选 ASR/TTS 端点，密钥只在网关）：
+
+```bash
+LIGHT_VOICE_LLM_URL=https://api.openai.com/v1/chat/completions \
+LIGHT_VOICE_LLM_KEY=sk-... LIGHT_VOICE_LLM_MODEL=gpt-4o-mini \
+go run ./cmd/gateway
+```
+
+设备端固件见 [firmware/esp32-voice/](firmware/esp32-voice/)（ESP32-S3 + I2S 麦克风/扬声器 + 按键说话）。控制台「小智 / 语音」面板可看连接状态、推送播报、切唤醒。协议、环境变量与测试方法详见 [docs/realtime-voice.md](docs/realtime-voice.md)。
+
+## 跨端 SDK
+
+`sdk/` 是零依赖 TypeScript SDK，封装功能 API（设备/命令/遥测/档案/围栏轨迹/OTA/语音 + 各品类语义化控制助手）、设备配网（SoftAP 门户）与实时语音会话，可在浏览器/Node/React Native/Electron 复用。原生 Android/iOS 照协议做薄封装即可。详见 [sdk/README.md](sdk/README.md)。
+
+```bash
+cd sdk && npm run build && npm test
+```
+
+## OTA 固件管理
+
+管理员上传固件二进制（按 category/model + 版本，存元数据 + SHA-256 + blob），给设备设目标版本或一键灰度整类；设备轮询 `GET /api/v1/devices/{id}/ota` 发现更新后，带设备 Token 下载、校验 SHA-256、刷写重启。
+
+- 管理员接口：`POST /api/v1/firmware?category=&version=`（body 为二进制）上传、`GET /api/v1/firmware` 列表、`POST /api/v1/firmware/{id}/rollout` 灰度、`POST /api/v1/devices/{id}/ota/target` 设目标。
+- 设备接口（设备 Token）：`GET /api/v1/devices/{id}/ota` 查询、`GET /api/v1/devices/{id}/firmware/{fwId}/download` 下载。
+- 管理台「固件 / OTA」面板：看当前/目标版本、上传固件、设目标、灰度。
+- 设备端 OTA 例程见 [firmware/esp32-light/](firmware/esp32-light/)（可移植到其他固件）。
+
+注意：OTA 目标与地理围栏等服务端状态在设备重启重新注册时会被保留（不被设备上报覆盖）。
+
+## 管理后台登录鉴权
+
+运营接口（设备列表/详情、下发命令、Token 重置、启停、围栏、轨迹、事件、实时状态/播报、profiles）需要管理员会话；设备数据面（register、heartbeat、telemetry、commands/next、ack、ws）仍用设备 Token，与管理员登录无关。
+
+管理员账号从环境变量读取，设置密码即启用鉴权：
+
+```bash
+LIGHT_ADMIN_USER=admin LIGHT_ADMIN_PASSWORD=请改成强密码 go run ./cmd/gateway
+```
+
+- 启用后：管理台显示登录页；登录成功发 24 小时会话 Token（前端存 localStorage，请求带 `Authorization: Bearer`）。`POST /api/v1/auth/login` 取 Token，`/api/v1/auth/status` 查询是否需要登录，`POST /api/v1/auth/logout` 注销。
+- 未设密码：**开放模式**（本地开发方便），网关启动告警，管理台跳过登录。对外部署务必设置密码。
+
+> 注意：`scripts/smoke.sh` 默认针对开放模式；若启用了管理员鉴权，命令创建等运营接口需要带 Token。
+
+## 能力档案
+
+`GET /api/v1/profiles` 返回内置能力档案（`light.v1 / clock.v1 / gps.v1 / voice.v1`）。设备注册时带 `category`（如 `light`）会自动绑定默认档案，平台据此校验命令类型，管理台据此渲染对应控制面板。无档案的设备（如串口/Linux 桥接 Agent）不受命令限制。
+
 ## 测试
 
 ```bash

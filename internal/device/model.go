@@ -2,6 +2,8 @@ package device
 
 import "time"
 
+// DeviceType is the access class of a device. It decides how the device
+// authenticates and which transport/channel it uses, NOT what product it is.
 type DeviceType string
 
 const (
@@ -10,6 +12,19 @@ const (
 	DeviceTypeOrangePi  DeviceType = "orangepi"
 	DeviceTypeLinuxNode DeviceType = "linux-node"
 	DeviceTypeUnknown   DeviceType = "unknown"
+)
+
+// DeviceCategory is the product class of a device. It decides the capability
+// profile (which commands/telemetry are valid) and how the console renders it.
+// This is the v2 productization axis layered on top of DeviceType.
+type DeviceCategory string
+
+const (
+	CategoryGeneric DeviceCategory = ""      // legacy / unclassified devices
+	CategoryLight   DeviceCategory = "light" // 灯带 / 小夜灯
+	CategoryClock   DeviceCategory = "clock" // 时钟 / 日历 / 天气屏
+	CategoryGPS     DeviceCategory = "gps"   // GPS 定位
+	CategoryVoice   DeviceCategory = "voice" // 小智 / 语音助手
 )
 
 type OnlineState string
@@ -36,10 +51,78 @@ type Capability struct {
 	Schema      map[string]string `json:"schema,omitempty"`
 }
 
+// Geofence is a circular geofence stored server-side so the gateway can detect
+// enter/exit transitions from incoming gps.fix telemetry.
+type Geofence struct {
+	CenterLat float64 `json:"centerLat"`
+	CenterLng float64 `json:"centerLng"`
+	RadiusM   float64 `json:"radiusM"`
+}
+
+// TrackPoint is one position sample, derived from gps.fix telemetry.
+type TrackPoint struct {
+	Lat       float64   `json:"lat"`
+	Lng       float64   `json:"lng"`
+	Speed     float64   `json:"speed,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// SetGeofenceRequest configures (or clears, with radiusM<=0) a device geofence.
+type SetGeofenceRequest struct {
+	CenterLat float64 `json:"centerLat"`
+	CenterLng float64 `json:"centerLng"`
+	RadiusM   float64 `json:"radiusM"`
+}
+
+// Firmware is an uploaded firmware artifact for a product category (+ optional
+// model). The binary blob is stored alongside this metadata.
+type Firmware struct {
+	ID        string         `json:"id"`
+	Category  DeviceCategory `json:"category"`
+	Model     string         `json:"model,omitempty"`
+	Version   string         `json:"version"`
+	Size      int64          `json:"size"`
+	SHA256    string         `json:"sha256"`
+	Notes     string         `json:"notes,omitempty"`
+	CreatedAt time.Time      `json:"createdAt"`
+}
+
+// AddFirmwareRequest carries firmware metadata (the binary comes in the body).
+type AddFirmwareRequest struct {
+	Category DeviceCategory
+	Model    string
+	Version  string
+	Notes    string
+}
+
+// SetTargetRequest sets a device's desired firmware version.
+type SetTargetRequest struct {
+	Version string `json:"version"`
+}
+
+// OTAStatus is what a device polls to learn whether an update is available.
+type OTAStatus struct {
+	UpdateAvailable bool   `json:"updateAvailable"`
+	CurrentVersion  string `json:"currentVersion"`
+	TargetVersion   string `json:"targetVersion,omitempty"`
+	FirmwareID      string `json:"firmwareId,omitempty"`
+	Version         string `json:"version,omitempty"`
+	SHA256          string `json:"sha256,omitempty"`
+	Size            int64  `json:"size,omitempty"`
+	DownloadURL     string `json:"downloadUrl,omitempty"`
+}
+
 type Device struct {
 	ID              string            `json:"id"`
 	Name            string            `json:"name"`
 	Type            DeviceType        `json:"type"`
+	Category        DeviceCategory    `json:"category,omitempty"`
+	Model           string            `json:"model,omitempty"`
+	Profile         string            `json:"profile,omitempty"`
+	FwVersion       string            `json:"fwVersion,omitempty"`
+	Geofence        *Geofence         `json:"geofence,omitempty"`
+	GeofenceState   string            `json:"geofenceState,omitempty"` // inside | outside | "" (unknown)
+	TargetFwVersion string            `json:"targetFwVersion,omitempty"`
 	AgentVersion    string            `json:"agentVersion,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty"`
 	Capabilities    []Capability      `json:"capabilities,omitempty"`
@@ -110,6 +193,10 @@ type RegisterDeviceRequest struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
 	Type         DeviceType        `json:"type"`
+	Category     DeviceCategory    `json:"category,omitempty"`
+	Model        string            `json:"model,omitempty"`
+	Profile      string            `json:"profile,omitempty"`
+	FwVersion    string            `json:"fwVersion,omitempty"`
 	AgentVersion string            `json:"agentVersion,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
 	Capabilities []Capability      `json:"capabilities,omitempty"`

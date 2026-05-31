@@ -14,7 +14,7 @@ func TestAPIRegistersDeviceAndReturnsList(t *testing.T) {
 		t.Fatalf("new store: %v", err)
 	}
 	mux := http.NewServeMux()
-	NewAPI(store, nil).RegisterRoutes(mux)
+	NewAPI(store, nil, nil, nil, nil).RegisterRoutes(mux)
 
 	body := bytes.NewBufferString(`{"id":"android-a","name":"Pixel Lab","type":"android"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/devices/register", body)
@@ -58,7 +58,7 @@ func TestAPIRequiresDeviceTokenForDeviceEndpoints(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	mux := http.NewServeMux()
-	NewAPI(store, nil).RegisterRoutes(mux)
+	NewAPI(store, nil, nil, nil, nil).RegisterRoutes(mux)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/devices/esp-a/telemetry", bytes.NewBufferString(`{"key":"temperature","value":24}`))
 	rec := httptest.NewRecorder()
