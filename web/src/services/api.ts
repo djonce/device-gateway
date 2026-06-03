@@ -242,6 +242,89 @@ export function listProfiles() {
   return request<{ items: Profile[] }>('/api/v1/profiles');
 }
 
+export interface FleetStats {
+  devicesByState: Record<string, number>;
+  devicesByCategory: Record<string, number>;
+  total: number;
+  disabled: number;
+  telemetryStored: number;
+  firmware: number;
+  registrations: number;
+  telemetryReceived: number;
+  commandsCreated: number;
+  commandAcks: number;
+  events: number;
+  realtimeConnections: number;
+}
+
+export function getStats() {
+  return request<FleetStats>('/api/v1/stats');
+}
+
+export interface RuleTrigger {
+  type: 'telemetry' | 'event';
+  key?: string;
+  op?: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'ne';
+  value?: number;
+  eventType?: string;
+  deviceId?: string;
+  category?: string;
+}
+export interface RuleAction {
+  type: 'command' | 'webhook';
+  targetDeviceId?: string;
+  targetCategory?: string;
+  commandType?: string;
+  payload?: Record<string, unknown>;
+  webhookUrl?: string;
+}
+export interface Rule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  trigger: RuleTrigger;
+  action: RuleAction;
+  createdAt: string;
+}
+
+export function listRules() {
+  return request<{ items: Rule[] }>('/api/v1/rules');
+}
+export function createRule(rule: Omit<Rule, 'id' | 'createdAt'>) {
+  return request<Rule>('/api/v1/rules', { method: 'POST', body: JSON.stringify(rule) });
+}
+export function setRuleEnabled(ruleId: string, enabled: boolean) {
+  return request<Rule>(`/api/v1/rules/${encodeURIComponent(ruleId)}/enable`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  });
+}
+export function deleteRule(ruleId: string) {
+  return request<{ ok: boolean }>(`/api/v1/rules/${encodeURIComponent(ruleId)}`, { method: 'DELETE' });
+}
+
+export interface TelemetryBucket {
+  t: string;
+  count: number;
+  min: number;
+  max: number;
+  avg: number;
+  last: number;
+}
+
+export function getTelemetrySeries(deviceId: string, key: string, bucket = 60, limit = 120) {
+  const qs = new URLSearchParams({ key, bucket: String(bucket), limit: String(limit) });
+  return request<{ items: TelemetryBucket[] }>(`/api/v1/devices/${encodeURIComponent(deviceId)}/telemetry/series?${qs.toString()}`);
+}
+
+/** Long-term rolled-up history over [fromSec, toSec] (unix seconds). Resolution is chosen by the gateway. */
+export function getTelemetryHistory(deviceId: string, key: string, fromSec: number, toSec: number) {
+  const qs = new URLSearchParams({ key, from: String(fromSec), to: String(toSec) });
+  return request<{ resolution: number; items: TelemetryBucket[] }>(
+    `/api/v1/devices/${encodeURIComponent(deviceId)}/telemetry/history?${qs.toString()}`,
+  );
+}
+
 export function getClockContent(lat: number, lon: number, tz: string) {
   const params = new URLSearchParams({ lat: String(lat), lon: String(lon), tz });
   return request<ClockContent>(`/api/v1/content/clock?${params.toString()}`);

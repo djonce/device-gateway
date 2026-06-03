@@ -5,9 +5,11 @@ import {
 	CloudSun,
 	Copy,
 	Cpu,
+	Gauge,
 	History,
 	KeyRound,
 	Lightbulb,
+	LineChart,
 	Loader2,
 	LogOut,
 	MapPin,
@@ -22,6 +24,7 @@ import {
 	Smartphone,
 	Terminal,
 	UploadCloud,
+	Zap,
 } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
@@ -37,14 +40,25 @@ import {
 	TrackPoint,
 	authStatus,
 	createCommand,
+	createRule,
+	deleteRule,
 	getClockContent,
 	getRealtimeStatus,
+	getStats,
+	getTelemetryHistory,
+	getTelemetrySeries,
 	getToken,
 	getTrack,
+	type FleetStats,
+	type Rule,
+	type RuleAction,
+	type RuleTrigger,
+	type TelemetryBucket,
   listCommands,
   listDevices,
 	listEvents,
 	listFirmware,
+	listRules,
 	listTelemetry,
 	login,
 	logout,
@@ -54,6 +68,7 @@ import {
 	sayToDevice,
 	setGeofence,
 	setOtaTarget,
+	setRuleEnabled,
 	updateDeviceStatus,
 	uploadFirmware,
 } from '@/services/api';
@@ -157,6 +172,7 @@ export default function HomePage() {
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
   const [commands, setCommands] = useState<Command[]>([]);
   const [events, setEvents] = useState<GatewayEvent[]>([]);
+  const [stats, setStats] = useState<FleetStats | null>(null);
   const [commandType, setCommandType] = useState('shell.exec');
   const [payload, setPayload] = useState('{"command":"uptime"}');
   const [lastToken, setLastToken] = useState('');
@@ -186,6 +202,10 @@ export default function HomePage() {
     }),
     [devices],
   );
+  const numericKeys = useMemo(
+    () => Array.from(new Set(telemetry.filter((point) => typeof point.value === 'number').map((point) => point.key))),
+    [telemetry],
+  );
 
   async function refresh(deviceId?: string, options: { silent?: boolean } = {}) {
     if (!options.silent) {
@@ -195,9 +215,10 @@ export default function HomePage() {
       setError('');
     }
     try {
-      const [deviceResponse, eventResponse] = await Promise.all([listDevices(), listEvents()]);
+      const [deviceResponse, eventResponse, statsResponse] = await Promise.all([listDevices(), listEvents(), getStats()]);
       setDevices(deviceResponse.items);
       setEvents(eventResponse.items);
+      setStats(statsResponse);
       const nextSelectedId = deviceId || selectedId || deviceResponse.items[0]?.id || '';
       setSelectedId(nextSelectedId);
       if (nextSelectedId) {
@@ -479,6 +500,9 @@ export default function HomePage() {
           {loading && <div className="loadingLine" />}
         </div>
 
+        {stats && <FleetDashboard stats={stats} />}
+        {authed && <AutomationPanel />}
+
         {selected ? (
           <div className="contentGrid">
             {selected.category === 'light' && (
@@ -606,6 +630,8 @@ export default function HomePage() {
                 </div>
               </div>
             </section>
+
+            {numericKeys.length > 0 && <TelemetryChart device={selected} numericKeys={numericKeys} />}
 
             <section className="panel">
               <PanelTitle icon={<Activity size={18} />} title="Telemetry" />
@@ -1290,6 +1316,337 @@ function OtaPanel({ device, onChanged }: { device: Device; onChanged: () => void
           上传固件（{device.category}）
         </button>
         {localError && <span className="fieldError">{localError}</span>}
+      </div>
+    </section>
+  );
+}
+
+const RULE_CATEGORIES = ['', 'light', 'clock', 'gps', 'voice'];
+
+function ruleSummary(rule: Rule): string {
+  const t = rule.trigger;
+  const trigger =
+    t.type === 'telemetry'
+      ? `${t.key} ${t.op} ${t.value}${t.category ? ` [${t.category}]` : ''}`
+      : `事件 ${t.eventType}${t.category ? ` [${t.category}]` : ''}`;
+  const a = rule.action;
+  const action =
+    a.type === 'command'
+      ? `→ ${a.commandType}${a.targetCategory ? ` @${a.targetCategory}` : a.targetDeviceId ? ` @${a.targetDeviceId}` : ' @触发设备'}`
+      : `→ webhook`;
+  return `${trigger} ${action}`;
+}
+
+function AutomationPanel() {
+  const [rules, setRules] = useState<Rule[]>([]);
+  const [name, setName] = useState('');
+  const [triggerType, setTriggerType] = useState<'telemetry' | 'event'>('telemetry');
+  const [tKey, setTKey] = useState('env.temp');
+  const [tOp, setTOp] = useState<'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'ne'>('gt');
+  const [tValue, setTValue] = useState('30');
+  const [tEventType, setTEventType] = useState('geofence.exit');
+  const [tCategory, setTCategory] = useState('');
+  const [actionType, setActionType] = useState<'command' | 'webhook'>('command');
+  const [aTargetCategory, setATargetCategory] = useState('');
+  const [aCommandType, setACommandType] = useState('light.power');
+  const [aPayload, setAPayload] = useState('{"on":true}');
+  const [aWebhookUrl, setAWebhookUrl] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function reload() {
+    try {
+      setRules((await listRules()).items);
+    } catch {
+      /* ignore */
+    }
+  }
+  useEffect(() => {
+    reload();
+  }, []);
+
+  async function create() {
+    setError('');
+    if (!name.trim()) {
+      setError('规则需要名称');
+      return;
+    }
+    const trigger: RuleTrigger =
+      triggerType === 'telemetry'
+        ? { type: 'telemetry', key: tKey.trim(), op: tOp, value: Number(tValue), category: tCategory || undefined }
+        : { type: 'event', eventType: tEventType.trim(), category: tCategory || undefined };
+    let action: RuleAction;
+    if (actionType === 'command') {
+      let payload: Record<string, unknown> | undefined;
+      try {
+        payload = aPayload.trim() ? JSON.parse(aPayload) : undefined;
+      } catch {
+        setError('命令 payload JSON 无效');
+        return;
+      }
+      action = { type: 'command', targetCategory: aTargetCategory || undefined, commandType: aCommandType.trim(), payload };
+    } else {
+      if (!aWebhookUrl.trim()) {
+        setError('Webhook 需要 URL');
+        return;
+      }
+      action = { type: 'webhook', webhookUrl: aWebhookUrl.trim() };
+    }
+    setBusy(true);
+    try {
+      await createRule({ name: name.trim(), enabled: true, trigger, action });
+      setName('');
+      await reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '创建失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggle(rule: Rule) {
+    await setRuleEnabled(rule.id, !rule.enabled);
+    await reload();
+  }
+  async function remove(rule: Rule) {
+    await deleteRule(rule.id);
+    await reload();
+  }
+
+  return (
+    <section className="panel">
+      <PanelTitle icon={<Zap size={18} />} title="自动化规则" />
+      <div className="formGrid">
+        {rules.length === 0 && <span className="fieldHint">还没有规则。比如「env.temp &gt; 30 → 给 light 类下发 light.power」。</span>}
+        {rules.map((rule) => (
+          <div key={rule.id} className="formMeta">
+            <label className="switchLabel">
+              <input type="checkbox" checked={rule.enabled} onChange={() => toggle(rule)} />
+              <strong>{rule.name}</strong>
+            </label>
+            <span>{ruleSummary(rule)}</span>
+            <button type="button" className="linkButton" onClick={() => remove(rule)}>
+              删除
+            </button>
+          </div>
+        ))}
+
+        <label>
+          规则名称
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="如 高温自动开灯" />
+        </label>
+
+        <div className="formMeta">
+          <label className="switchLabel">
+            触发
+            <select value={triggerType} onChange={(e) => setTriggerType(e.target.value as 'telemetry' | 'event')}>
+              <option value="telemetry">遥测阈值</option>
+              <option value="event">事件</option>
+            </select>
+          </label>
+          {triggerType === 'telemetry' ? (
+            <>
+              <input value={tKey} onChange={(e) => setTKey(e.target.value)} placeholder="遥测 key" style={{ width: 110 }} />
+              <select value={tOp} onChange={(e) => setTOp(e.target.value as typeof tOp)}>
+                {['gt', 'gte', 'lt', 'lte', 'eq', 'ne'].map((o) => (
+                  <option key={o} value={o}>
+                    {o}
+                  </option>
+                ))}
+              </select>
+              <input value={tValue} onChange={(e) => setTValue(e.target.value)} style={{ width: 70 }} />
+            </>
+          ) : (
+            <input value={tEventType} onChange={(e) => setTEventType(e.target.value)} placeholder="事件类型" style={{ width: 160 }} />
+          )}
+          <select value={tCategory} onChange={(e) => setTCategory(e.target.value)}>
+            {RULE_CATEGORIES.map((c) => (
+              <option key={c} value={c}>
+                {c === '' ? '任意类别' : c}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="formMeta">
+          <label className="switchLabel">
+            动作
+            <select value={actionType} onChange={(e) => setActionType(e.target.value as 'command' | 'webhook')}>
+              <option value="command">下发命令</option>
+              <option value="webhook">Webhook</option>
+            </select>
+          </label>
+          {actionType === 'command' ? (
+            <>
+              <select value={aTargetCategory} onChange={(e) => setATargetCategory(e.target.value)}>
+                <option value="">目标=触发设备</option>
+                {RULE_CATEGORIES.filter((c) => c).map((c) => (
+                  <option key={c} value={c}>
+                    广播 {c}
+                  </option>
+                ))}
+              </select>
+              <input value={aCommandType} onChange={(e) => setACommandType(e.target.value)} placeholder="命令 type" style={{ width: 120 }} />
+              <input value={aPayload} onChange={(e) => setAPayload(e.target.value)} placeholder="payload JSON" style={{ width: 150 }} />
+            </>
+          ) : (
+            <input value={aWebhookUrl} onChange={(e) => setAWebhookUrl(e.target.value)} placeholder="https://..." style={{ width: 280 }} />
+          )}
+        </div>
+
+        <button type="button" className="primaryButton" onClick={create} disabled={busy}>
+          {busy ? <Loader2 size={16} className="spin" /> : <Zap size={16} />}
+          新建规则
+        </button>
+        {error && <span className="fieldError">{error}</span>}
+      </div>
+    </section>
+  );
+}
+
+function FleetDashboard({ stats }: { stats: FleetStats }) {
+  const stat = (label: string, value: number, tone = '') => (
+    <span className={tone}>
+      {label} <strong>{value}</strong>
+    </span>
+  );
+  return (
+    <section className="panel">
+      <PanelTitle icon={<Gauge size={18} />} title="舰队概览" />
+      <div className="formGrid">
+        <div className="formMeta" style={{ flexWrap: 'wrap', gap: 14 }}>
+          {stat('在线', stats.devicesByState.online ?? 0)}
+          {stat('弱网', stats.devicesByState.stale ?? 0)}
+          {stat('离线', stats.devicesByState.offline ?? 0, (stats.devicesByState.offline ?? 0) > 0 ? 'fieldError' : '')}
+          {stat('禁用', stats.disabled)}
+          {stat('实时连接', stats.realtimeConnections)}
+        </div>
+        <div className="formMeta" style={{ flexWrap: 'wrap', gap: 14 }}>
+          {Object.entries(stats.devicesByCategory).map(([k, v]) => (
+            <span key={k}>
+              {k} <strong>{v}</strong>
+            </span>
+          ))}
+        </div>
+        <div className="formMeta" style={{ flexWrap: 'wrap', gap: 14 }}>
+          {stat('遥测累计', stats.telemetryReceived)}
+          {stat('命令', stats.commandsCreated)}
+          {stat('事件', stats.events)}
+          {stat('固件', stats.firmware)}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function buildSparkline(series: TelemetryBucket[]): { line: string; lastX: number; lastY: number; lo: number; hi: number } {
+  if (series.length === 0) return { line: '', lastX: 0, lastY: 0, lo: 0, hi: 0 };
+  const W = 320;
+  const H = 120;
+  const pad = 10;
+  const lo = Math.min(...series.map((b) => b.min));
+  const hi = Math.max(...series.map((b) => b.max));
+  const span = hi - lo || 1;
+  const n = series.length;
+  const x = (i: number) => pad + (n === 1 ? 0 : (i * (W - 2 * pad)) / (n - 1));
+  const y = (v: number) => H - pad - ((v - lo) / span) * (H - 2 * pad);
+  const line = series.map((b, i) => `${x(i).toFixed(1)},${y(b.avg).toFixed(1)}`).join(' ');
+  return { line, lastX: x(n - 1), lastY: y(series[n - 1].avg), lo, hi };
+}
+
+const RANGE_SECONDS: Record<string, number> = { '1h': 3600, '24h': 86400, '7d': 604800, '30d': 2592000 };
+function resolutionLabel(res: number): string {
+  if (res >= 86400) return '1d';
+  if (res >= 3600) return '1h';
+  return '1m';
+}
+
+function TelemetryChart({ device, numericKeys }: { device: Device; numericKeys: string[] }) {
+  const [key, setKey] = useState(numericKeys[0] ?? '');
+  const [range, setRange] = useState<'live' | '1h' | '24h' | '7d' | '30d'>('live');
+  const [series, setSeries] = useState<TelemetryBucket[]>([]);
+  const [resolution, setResolution] = useState(60);
+
+  useEffect(() => {
+    if (!numericKeys.includes(key)) setKey(numericKeys[0] ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [numericKeys]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!key) {
+      setSeries([]);
+      return;
+    }
+    const load =
+      range === 'live'
+        ? getTelemetrySeries(device.id, key, 60, 120).then((res) => ({ items: res.items, resolution: 60 }))
+        : (() => {
+            const to = Math.floor(Date.now() / 1000);
+            return getTelemetryHistory(device.id, key, to - RANGE_SECONDS[range], to);
+          })();
+    Promise.resolve(load)
+      .then((res) => {
+        if (alive) {
+          setSeries(res.items);
+          setResolution(res.resolution);
+        }
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [device.id, key, range]);
+
+  const spark = useMemo(() => buildSparkline(series), [series]);
+
+  return (
+    <section className="panel">
+      <PanelTitle icon={<LineChart size={18} />} title="遥测趋势" />
+      <div className="formGrid">
+        <div className="formMeta">
+          <label className="switchLabel">
+            指标
+            <select value={key} onChange={(event) => setKey(event.target.value)}>
+              {numericKeys.map((k) => (
+                <option key={k} value={k}>
+                  {k}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="switchLabel">
+            范围
+            <select value={range} onChange={(event) => setRange(event.target.value as typeof range)}>
+              <option value="live">实时</option>
+              <option value="1h">1 小时</option>
+              <option value="24h">24 小时</option>
+              <option value="7d">7 天</option>
+              <option value="30d">30 天</option>
+            </select>
+          </label>
+        </div>
+        <svg viewBox="0 0 320 120" style={{ width: '100%', background: '#0e1622', borderRadius: 8 }}>
+          {spark.line ? (
+            <>
+              <polyline points={spark.line} fill="none" stroke="#3ad1a8" strokeWidth={2} />
+              <circle cx={spark.lastX} cy={spark.lastY} r={3} fill="#ffd9a0" />
+            </>
+          ) : (
+            <text x={160} y={60} fill="#5f6b7d" fontSize={12} textAnchor="middle">
+              暂无数据
+            </text>
+          )}
+        </svg>
+        <div className="formMeta">
+          <span>
+            {series.length} 桶 · 分辨率 {resolutionLabel(resolution)}
+            {range === 'live' ? '（实时 raw）' : '（rollup）'}
+          </span>
+          <span>范围 {spark.lo.toFixed(1)} ~ {spark.hi.toFixed(1)}</span>
+        </div>
       </div>
     </section>
   );

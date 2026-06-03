@@ -1,6 +1,7 @@
 package device
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,16 +13,22 @@ import (
 
 	"light-gateway/internal/auth"
 	"light-gateway/internal/realtime"
+	"light-gateway/internal/rules"
 	"light-gateway/internal/weather"
 )
 
 type API struct {
-	store    *Store
-	logger   *slog.Logger
-	weather  *weather.Service
-	realtime *realtime.Hub
-	auth     *auth.Authenticator
+	store        *Store
+	logger       *slog.Logger
+	weather      *weather.Service
+	realtime     *realtime.Hub
+	auth         *auth.Authenticator
+	provisionKey string
 }
+
+// SetProvisionKey requires a matching X-Provision-Key header (or a valid admin
+// session) on device registration. Empty key = open registration.
+func (a *API) SetProvisionKey(key string) { a.provisionKey = strings.TrimSpace(key) }
 
 func NewAPI(store *Store, logger *slog.Logger, weatherSvc *weather.Service, hub *realtime.Hub, authn *auth.Authenticator) *API {
 	if logger == nil {
@@ -31,8 +38,9 @@ func NewAPI(store *Store, logger *slog.Logger, weatherSvc *weather.Service, hub 
 }
 
 func (a *API) RegisterRoutes(mux *http.ServeMux) {
-	// Public: health, auth, device bootstrap, and read-only content.
+	// Public: health, metrics, auth, device bootstrap, and read-only content.
 	mux.HandleFunc("GET /health", a.health)
+	mux.HandleFunc("GET /metrics", a.metrics)
 	mux.HandleFunc("GET /api/v1/auth/status", a.authStatus)
 	mux.HandleFunc("POST /api/v1/auth/login", a.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", a.admin(a.logout))
@@ -55,6 +63,9 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/devices/{deviceID}/token/reset", a.admin(a.resetDeviceToken))
 	mux.HandleFunc("POST /api/v1/devices/{deviceID}/status", a.admin(a.updateDeviceStatus))
 	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry", a.admin(a.listTelemetry))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry/series", a.admin(a.telemetrySeries))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry/history", a.admin(a.telemetryHistory))
+	mux.HandleFunc("GET /api/v1/stats", a.admin(a.stats))
 	mux.HandleFunc("POST /api/v1/devices/{deviceID}/geofence", a.admin(a.setGeofence))
 	mux.HandleFunc("GET /api/v1/devices/{deviceID}/track", a.admin(a.listTrack))
 	mux.HandleFunc("POST /api/v1/devices/{deviceID}/commands", a.admin(a.createCommand))
@@ -66,6 +77,10 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/firmware", a.admin(a.uploadFirmware))
 	mux.HandleFunc("GET /api/v1/firmware", a.admin(a.listFirmware))
 	mux.HandleFunc("POST /api/v1/firmware/{firmwareID}/rollout", a.admin(a.rolloutFirmware))
+	mux.HandleFunc("GET /api/v1/rules", a.admin(a.listRules))
+	mux.HandleFunc("POST /api/v1/rules", a.admin(a.createRule))
+	mux.HandleFunc("POST /api/v1/rules/{ruleID}/enable", a.admin(a.setRuleEnabled))
+	mux.HandleFunc("DELETE /api/v1/rules/{ruleID}", a.admin(a.deleteRule))
 }
 
 // admin wraps an operator endpoint with admin-session auth. In open mode (no
@@ -131,6 +146,99 @@ func (a *API) listProfiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": Profiles()})
 }
 
+func (a *API) realtimeConnections() int {
+	if a.realtime == nil {
+		return 0
+	}
+	return a.realtime.Count()
+}
+
+// metrics serves Prometheus text exposition (public, for scrapers).
+func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(a.store.Stats().PrometheusMetrics(a.realtimeConnections())))
+}
+
+// stats serves the fleet snapshot as JSON for the console dashboard.
+func (a *API) stats(w http.ResponseWriter, r *http.Request) {
+	st := a.store.Stats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"devicesByState":      st.DevicesByState,
+		"devicesByCategory":   st.DevicesByCategory,
+		"total":               st.Total,
+		"disabled":            st.Disabled,
+		"telemetryStored":     st.TelemetryStored,
+		"firmware":            st.Firmware,
+		"registrations":       st.Registrations,
+		"telemetryReceived":   st.TelemetryReceived,
+		"commandsCreated":     st.CommandsCreated,
+		"commandAcks":         st.CommandAcks,
+		"events":              st.Events,
+		"realtimeConnections": a.realtimeConnections(),
+	})
+}
+
+func (a *API) listRules(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"items": a.store.ListRules()})
+}
+
+func (a *API) createRule(w http.ResponseWriter, r *http.Request) {
+	var rule rules.Rule
+	if !decodeJSON(w, r, &rule) {
+		return
+	}
+	created, err := a.store.AddRule(rule)
+	respond(w, created, err, http.StatusCreated)
+}
+
+func (a *API) setRuleEnabled(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	rule, err := a.store.SetRuleEnabled(r.PathValue("ruleID"), body.Enabled)
+	respond(w, rule, err, http.StatusOK)
+}
+
+func (a *API) deleteRule(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.DeleteRule(r.PathValue("ruleID")); err != nil {
+		respond(w, nil, err, http.StatusOK)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *API) telemetrySeries(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "key query param is required")
+		return
+	}
+	bucket := parseQueryInt(r, "bucket", 60)
+	limit := parseQueryInt(r, "limit", 120)
+	series, err := a.store.TelemetrySeries(r.PathValue("deviceID"), key, bucket, limit)
+	respond(w, map[string]any{"items": series}, err, http.StatusOK)
+}
+
+// telemetryHistory serves long-term rolled-up history for a key over a time
+// window (?from=&to= unix seconds; default last 24h). Resolution is chosen
+// from the window width.
+func (a *API) telemetryHistory(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "key query param is required")
+		return
+	}
+	now := time.Now().Unix()
+	to := int64(parseQueryInt(r, "to", int(now)))
+	from := int64(parseQueryInt(r, "from", int(to-24*3600)))
+	resolution, series, err := a.store.TelemetryHistory(r.PathValue("deviceID"), key, time.Unix(from, 0), time.Unix(to, 0))
+	respond(w, map[string]any{"resolution": resolution, "items": series}, err, http.StatusOK)
+}
+
 // clockContent returns current time + weather for a location. Routine content
 // for clock-category devices, which poll it instead of holding a weather API
 // key. Read-only public data, so no device token is required.
@@ -149,7 +257,25 @@ func (a *API) clockContent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.weather.ClockContent(lat, lon, tz))
 }
 
+// allowRegister gates device self-registration. When a provisioning key is
+// configured, the caller must present it (X-Provision-Key) or hold a valid
+// admin session (so the console/admin can still register devices).
+func (a *API) allowRegister(r *http.Request) bool {
+	if a.provisionKey == "" {
+		return true
+	}
+	key := strings.TrimSpace(r.Header.Get("X-Provision-Key"))
+	if key != "" && subtle.ConstantTimeCompare([]byte(key), []byte(a.provisionKey)) == 1 {
+		return true
+	}
+	return a.auth != nil && a.auth.Enabled() && a.auth.Validate(a.bearerToken(r))
+}
+
 func (a *API) registerDevice(w http.ResponseWriter, r *http.Request) {
+	if !a.allowRegister(r) {
+		writeError(w, http.StatusUnauthorized, "a valid provisioning key or admin session is required to register")
+		return
+	}
 	var req RegisterDeviceRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -486,6 +612,18 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": message})
+}
+
+func parseQueryInt(r *http.Request, name string, fallback int) int {
+	value := r.URL.Query().Get(name)
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
 }
 
 func parseLimit(r *http.Request, fallback int) int {

@@ -178,6 +178,33 @@ go run ./cmd/gateway
 
 设备端固件见 [firmware/esp32-voice/](firmware/esp32-voice/)（ESP32-S3 + I2S 麦克风/扬声器 + 按键说话）。控制台「小智 / 语音」面板可看连接状态、推送播报、切唤醒。协议、环境变量与测试方法详见 [docs/realtime-voice.md](docs/realtime-voice.md)。
 
+## 自动化规则 + 通知
+
+让网关从"记录器"变成"会反应的中枢"：遥测/事件触发 → 下发命令或 Webhook 通知。
+
+- **触发器**：遥测阈值（`key op value`，op=gt/gte/lt/lte/eq/ne）或事件类型（如 `geofence.exit`），可加 deviceId/category 过滤。
+- **动作**：下发命令（给触发设备 / 指定设备 / 整类广播）或 Webhook（POST JSON 含触发上下文）。
+- **求值**：纯函数 `internal/rules.Evaluate` 决定动作；Store 在遥测/事件处挂钩，仅当有启用规则时异步执行；触发自身的 `command.*`/`rule.fired`/`telemetry.received` 等被 denylist 排除以防环。规则触发会记 `rule.fired` 事件。
+- 管理员接口：`GET/POST /api/v1/rules`、`POST …/{id}/enable`、`DELETE …/{id}`；管理台「自动化规则」面板可建/列/启停/删。
+
+例：「`env.temp > 30` → 给 `light` 类广播 `light.power {on:true}`」，或「`geofence.exit` → Webhook 通知」。
+
+## 可观测性 / 监控
+
+- `GET /metrics`（公开，Prometheus 文本，零依赖手写）：设备按在线状态/类别计数、禁用数、实时连接数、存储遥测点数、固件数，以及注册/遥测/命令/回执/事件累计计数器。可直接被 Prometheus 抓取。
+- `GET /api/v1/stats`（管理员）：同一份快照的 JSON，给管理台舰队仪表盘用。
+- `GET /api/v1/devices/{id}/telemetry/series?key=&bucket=&limit=`（管理员）：实时 raw 分桶聚合（最近 ≤500 条）。
+- `GET /api/v1/devices/{id}/telemetry/history?key=&from=&to=`（管理员）：**长期历史**，从 rollup 卷叠按时间范围自动选分辨率（1m/1h/1d）。
+- 管理台顶部「舰队概览」面板，设备视图内「遥测趋势」SVG 折线图（零图表库），范围选「实时/1h/24h/7d/30d」。
+
+### 长期时序保留（rollup 降采样）
+
+raw 遥测每设备只留最近 500 条（实时细节）。数值遥测同时被**降采样**进 `telemetry_rollup` 表（每设备每指标 min/max/avg/last），保留更久：1m 卷叠留 48h、1h 留 30 天、1d 留 1 年——存储是常数级而非随上报频率线性增长。写入是增量 upsert（无批处理任务），保留过期由网关每分钟 `PruneRollups` 滚动清理。查询按时间范围自动选分辨率（窗口越宽分辨率越粗，每次只返回 ≤1000 桶）。仅适用于标量数值指标（rssi/temp/brightness/speed 等；`gps.fix` 等对象走轨迹接口）。
+
+```bash
+curl -s http://127.0.0.1:7001/metrics
+```
+
 ## 跨端 SDK
 
 `sdk/` 是零依赖 TypeScript SDK，封装功能 API（设备/命令/遥测/档案/围栏轨迹/OTA/语音 + 各品类语义化控制助手）、设备配网（SoftAP 门户）与实时语音会话，可在浏览器/Node/React Native/Electron 复用。原生 Android/iOS 照协议做薄封装即可。详见 [sdk/README.md](sdk/README.md)。
@@ -196,6 +223,19 @@ cd sdk && npm run build && npm test
 - 设备端 OTA 例程见 [firmware/esp32-light/](firmware/esp32-light/)（可移植到其他固件）。
 
 注意：OTA 目标与地理围栏等服务端状态在设备重启重新注册时会被保留（不被设备上报覆盖）。
+
+## 设备注册预配密钥
+
+默认任何人都能调 `POST /api/v1/devices/register` 注册设备并拿 Token。设置 `LIGHT_PROVISION_KEY` 后，注册必须满足其一：请求头带正确的 `X-Provision-Key`，**或**持有效管理员会话（这样控制台/管理端仍可注册）。未设置则保持开放（启动告警）。
+
+```bash
+LIGHT_PROVISION_KEY=你的预配密钥 go run ./cmd/gateway
+```
+
+设备端带密钥：
+- SDK：`new LightGatewayClient({ baseUrl, provisionKey })`，`registerDevice` 自动带头。
+- Go Agent：`-provision-key`（或 `LIGHT_AGENT_PROVISION_KEY` / `LIGHT_SERIAL_PROVISION_KEY`）。
+- ESP 固件：配网门户的「Provision Key」字段（esp32-light 已接入；clock/gps/voice 固件在 `httpJSON` 注册请求里加一行 `X-Provision-Key` 头即可，与 esp32-light 一致）。
 
 ## 管理后台登录鉴权
 
@@ -239,6 +279,20 @@ BASE_URL=http://127.0.0.1:7001 scripts/smoke.sh
 ```
 
 该脚本会完成健康检查、设备注册、遥测上报、命令创建、命令拉取和命令回执。
+
+## 持续集成 (CI)
+
+`.github/workflows/ci.yml` 在每次 push / PR 上并行跑三个 job：
+
+- **go**：`gofmt`（报告）+ `go vet` + `go build` + `go test ./...`（Go 版本按 `go.mod` 取）。
+- **web**：`pnpm install --frozen-lockfile` + `pnpm typecheck` + `pnpm build`。
+- **sdk**：`npm install` + `npm test`（tsc 类型检查 + `node --test`，零额外运行时依赖）。
+
+本地一键复跑全部：
+
+```bash
+scripts/test-all.sh
+```
 
 ## 设计文档
 

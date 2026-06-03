@@ -6,7 +6,61 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"light-gateway/internal/auth"
 )
+
+func registerReq(key, bearer string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/devices/register", bytes.NewBufferString(`{"id":"d1","name":"D1","type":"esp"}`))
+	if key != "" {
+		req.Header.Set("X-Provision-Key", key)
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	return req
+}
+
+func TestRegisterRequiresProvisionKey(t *testing.T) {
+	store, _ := NewStore("")
+	api := NewAPI(store, nil, nil, nil, nil)
+	api.SetProvisionKey("enroll-secret")
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	cases := []struct {
+		name string
+		key  string
+		want int
+	}{
+		{"no key", "", http.StatusUnauthorized},
+		{"wrong key", "nope", http.StatusUnauthorized},
+		{"correct key", "enroll-secret", http.StatusCreated},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, registerReq(c.key, ""))
+		if rec.Code != c.want {
+			t.Fatalf("%s: expected %d, got %d (%s)", c.name, c.want, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestRegisterAllowsAdminSession(t *testing.T) {
+	store, _ := NewStore("")
+	authn := auth.New("admin", "pw")
+	api := NewAPI(store, nil, nil, nil, authn)
+	api.SetProvisionKey("enroll-secret")
+	token, _, _ := authn.Login("admin", "pw")
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, registerReq("", token)) // no provision key, but admin session
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected admin session to allow register, got %d (%s)", rec.Code, rec.Body.String())
+	}
+}
 
 func TestAPIRegistersDeviceAndReturnsList(t *testing.T) {
 	store, err := NewStore("")

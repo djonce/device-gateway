@@ -395,5 +395,71 @@ type Device struct {
 
 **验证**：`streamChunks` 前瞻分片（含空输入/单块/多块）、音频 `commit` 流式（asr.final→tts.say→多个 `tts.audio` seq/final/codec）、`welcome` 通告 codec、注入式 fake 管线均有 Go 单测；并用 Python 独立复核了分片前瞻逻辑；SDK `npm test` 9/9 通过。
 
+## 19. 可观测性 + 舰队仪表盘（已落地）
+
+让系统「看得见趋势」。新增（仍零外部依赖）：
+
+**统计与时序**（新增 `internal/device/metrics.go`）：Store 增量计数器（注册/遥测/命令/回执/事件，均在已持锁的方法内自增）；`Stats()` 实时快照（设备按在线状态与产品类别计数、禁用数、存储遥测点、固件数、累计计数器）；`TelemetrySeries(key, bucket, limit)` 把数值遥测按时间分桶聚合 min/max/avg/last（非数值忽略）。
+
+**接口**：`GET /metrics`（公开，**手写 Prometheus 文本**，含实时连接数，可直接被抓取）；`GET /api/v1/stats`（管理员 JSON）；`GET …/telemetry/series`（管理员，趋势图数据）。
+
+**管理台**：顶部「舰队概览」面板（状态/类别/总量/实时连接），设备视图「遥测趋势」**零图表库 SVG 折线**（按数值指标选择、60s 分桶聚合）。
+
+**验证**：`Stats` 状态/类别计数与计数器、`TelemetrySeries` 分桶（同桶聚合 + 跨桶 + 忽略非数值键）、Prometheus 文本格式均有 Go 单测；用 Python 独立复核了分桶边界（`ts/60*60`）与 Prometheus 标签/类型行；`web typecheck` 通过。
+
+**仍待深化**：长期时序保留（当前每设备 raw 上限 500，趋势图取此窗口）可引入 rollup 表或 TSDB；告警规则与通知投递（事件目前只记录不投递）是下一个自然增量。
+
+## 20. 自动化规则引擎 + 通知（已落地）
+
+把"事件只记录不投递、数据不联动"补上——网关从记录器变成会反应的中枢（仍零外部依赖）。
+
+**纯引擎**（新增 `internal/rules`）：`Rule = Trigger + Action`。触发器 `telemetry`（`key op value`，op=gt/gte/lt/lte/eq/ne）或 `event`（事件类型），可加 deviceId/category 过滤。动作 `command`（目标=触发设备/指定设备/整类广播）或 `webhook`。`Evaluate(rules, ctx) []Outcome` 是**纯函数、无 I/O**，命令动作的空目标默认解析为触发设备。
+
+**Store 集成**（`internal/device/rules.go`）：规则 CRUD + SQLite 持久化 + 启用计数。`AddTelemetry`（数值遥测）与 `appendEventLocked`（事件）处挂钩，**仅当有启用规则时**才异步 `go fireRules`；防环 denylist 排除 `telemetry.received/command.*/rule.fired/rule.*/device.heartbeat`。`fireRules` 快照规则→`Evaluate`→执行：命令走 `CreateCommand`（经设备 profile 校验）、Webhook 走 `http.POST`（含触发上下文），并记 `rule.fired` 事件。异步执行 + 单独 goroutine 回调 Store，无锁重入。
+
+**接口/控制台/SDK**：管理员 `GET/POST /api/v1/rules`、`…/{id}/enable`、`DELETE …/{id}`；控制台「自动化规则」面板（建/列/启停/删，触发与动作表单）；SDK `listRules/createRule/setRuleEnabled/deleteRule`。
+
+**验证**：`rules.Evaluate` 全分支单测（阈值各 op、事件匹配、deviceId/category 过滤、默认目标、禁用、kind 不匹配）；Store 级单测（规则触发 → 按类别广播命令、启停/删除计数、denylist）；Python 独立核比较与匹配；SDK `npm test` 11/11；`web typecheck` 通过。
+
+示例：「`env.temp > 30` → 给 `light` 类广播 `light.power {on:true}`」「`geofence.exit` → Webhook 告警」。
+
+## 21. 设备注册预配密钥（已落地）
+
+堵上"任何人都能注册设备拿 Token"的开放注册口子（沿用 admin auth 的"配了才强制"思路）。
+
+**网关**：`API.SetProvisionKey(key)` + `allowRegister(r)`——配置 `LIGHT_PROVISION_KEY` 后，`register` 必须带正确 `X-Provision-Key`（constant-time 比对）**或**持有效管理员会话（控制台 Seed Demo / 管理端注册仍可用）；未配置则开放并启动告警。
+
+**设备端**：SDK `ClientOptions.provisionKey`（`registerDevice` 自动带头）；Go Agent `-provision-key` 标志（两支）；esp32-light 配网门户字段 + NVS 持久化 + `httpJSON` 注册头（其余三支 ESP 固件加同一行即可）。
+
+**验证**：`api_test` 覆盖无密钥 401 / 错密钥 401 / 对密钥 201 / 管理员会话放行 201；SDK `npm test` 12/12（含带头断言）；`web typecheck` 通过。
+
+后续安全增量：操作员 RBAC / API Key、TLS、设备 Token 轮换策略、审计。
+
+## 22. 持续集成（CI，已落地）
+
+把每次手跑的 go/web/sdk 三套测试自动化（`.github/workflows/ci.yml`，push/PR 触发，三 job 并行）：
+
+- **go**：`setup-go` 按 `go.mod` 取版本（1.25）→ `gofmt`（先报告不阻断，待全树格式化后可收紧为硬门禁）+ `go vet` + `go build` + `go test ./...`。
+- **web**：pnpm（v9，匹配 `lockfileVersion 9.0`）`--frozen-lockfile` + `typecheck` + `build`。
+- **sdk**：给 SDK 补 `typescript` devDependency 使其自包含 → `npm install` + `npm test`（tsc + `node --test`）。
+
+另加 `scripts/test-all.sh` 本地一键复跑全部，与 CI 一致。CI YAML 经 Python 解析校验（三 job、`go-version-file=go.mod`、web/sdk 工作目录正确）。
+
+此后回归不再靠手跑——CI 会在每次提交把编译/类型/单测一并兜住。
+
+## 23. 长期时序保留：rollup 降采样（已落地）
+
+补齐 §19 标注的"长期时序保留"，按零依赖、SQLite 自包含的路线做（而非引外部 TSDB）。
+
+**降采样金字塔**（新增 `internal/device/rollup.go` + `telemetry_rollup` 表）：raw 仍每设备留 500 条做实时细节；数值遥测同时按 1m/1h/1d 三个分辨率**增量 upsert**进 rollup（每桶 count/min/max/sum/last，内存 map 为真源 + SQLite 持久化），保留 48h/30d/1y——存储常数级、不随上报频率线性涨。`AddTelemetry` 里复用一次 `toFloat` 同时喂 rollup 与规则引擎；`gps.fix` 等对象型不进 rollup（走轨迹）。
+
+**保留与查询**：`PruneRollups()` 按各分辨率保留滚动清理（网关每分钟跑一次 ticker，测试直接调用，Store 无需后台生命周期）；`TelemetryHistory(key, from, to)` 按窗口宽度选分辨率（`chooseResolution`，每次 ≤1000 桶），`GET …/telemetry/history` 暴露。
+
+**控制台**：「遥测趋势」图加范围选择「实时/1h/24h/7d/30d」——实时走 raw series，其余走 rollup history 并显示所选分辨率（1m/1h/1d）。
+
+**验证**：分辨率选择、rollup 聚合与历史查询、按分辨率保留过期均有 Go 单测；Python 独立复核了分桶/分辨率/保留数学；`web typecheck` 通过。
+
+**权衡说明**：内存 rollup map 受保留上界约束（每设备每指标 ~4k 桶），小/中规模无虑；超大规模或需 Grafana/HA 时，可另加"每设备遥测 → Prometheus 带标签指标"导出作为可选升级路径，不绑死架构。
+
 ---
 *本文档基于当前仓库代码（`internal/device`、`cmd/*`、`firmware/esp32-wifi-agent`、`web`）梳理，与 `docs/access-model.md` 的接入模型一脉相承，作为其 v2 演进规划。第 9 节为阶段 0 已实现内容。*

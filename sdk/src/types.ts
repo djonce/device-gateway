@@ -188,6 +188,34 @@ export interface RealtimeStatus {
   connections: number;
 }
 
+export interface RuleTrigger {
+  type: 'telemetry' | 'event';
+  key?: string;
+  op?: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'ne';
+  value?: number;
+  eventType?: string;
+  deviceId?: string;
+  category?: string;
+}
+
+export interface RuleAction {
+  type: 'command' | 'webhook';
+  targetDeviceId?: string;
+  targetCategory?: string;
+  commandType?: string;
+  payload?: Record<string, unknown>;
+  webhookUrl?: string;
+}
+
+export interface Rule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  trigger: RuleTrigger;
+  action: RuleAction;
+  createdAt: string;
+}
+
 // Realtime voice envelope (lightgw.voice.v0).
 export interface VoiceEnvelope {
   type: string;

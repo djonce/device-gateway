@@ -93,6 +93,38 @@ test('provisionDevice POSTs urlencoded form to the portal', async () => {
   assert.ok((cap[0]!.init?.body as string).includes('ssid=home'));
 });
 
+test('registerDevice sends the provisioning key header when set', async () => {
+  const cap: Captured[] = [];
+  const client = new LightGatewayClient({ baseUrl: 'http://gw:7001', provisionKey: 'enroll-secret', fetch: fakeFetch({ device: { id: 'd1' }, token: 'lgw_x', reused: false }, cap) });
+  await client.registerDevice({ id: 'd1', name: 'D1', type: 'esp' });
+  assert.equal(cap[0]!.url, 'http://gw:7001/api/v1/devices/register');
+  assert.equal(headerOf(cap[0]!, 'X-Provision-Key'), 'enroll-secret');
+});
+
+test('createRule posts the rule definition', async () => {
+  const cap: Captured[] = [];
+  const client = new LightGatewayClient({ baseUrl: 'http://gw:7001', adminToken: 'ADM', fetch: fakeFetch({ id: 'rule-1' }, cap) });
+  await client.createRule({
+    name: 'hot->light',
+    enabled: true,
+    trigger: { type: 'telemetry', key: 'env.temp', op: 'gt', value: 30 },
+    action: { type: 'command', targetCategory: 'light', commandType: 'light.power', payload: { on: true } },
+  });
+  assert.equal(cap[0]!.url, 'http://gw:7001/api/v1/rules');
+  assert.equal(cap[0]!.init?.method, 'POST');
+  const body = JSON.parse(cap[0]!.init!.body as string);
+  assert.equal(body.trigger.op, 'gt');
+  assert.equal(body.action.targetCategory, 'light');
+});
+
+test('deleteRule issues a DELETE', async () => {
+  const cap: Captured[] = [];
+  const client = new LightGatewayClient({ baseUrl: 'http://gw:7001', adminToken: 'ADM', fetch: fakeFetch({ ok: true }, cap) });
+  await client.deleteRule('rule-1');
+  assert.equal(cap[0]!.url, 'http://gw:7001/api/v1/rules/rule-1');
+  assert.equal(cap[0]!.init?.method, 'DELETE');
+});
+
 test('VoiceSession builds the ws url with token and sends text', () => {
   const sent: string[] = [];
   const session = new VoiceSession({

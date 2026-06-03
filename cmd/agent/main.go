@@ -27,6 +27,7 @@ type config struct {
 	DeviceID        string
 	DeviceName      string
 	TokenFile       string
+	ProvisionKey    string
 	HeartbeatEvery  time.Duration
 	CommandTimeout  time.Duration
 	AllowedCommands map[string]bool
@@ -61,6 +62,7 @@ func loadConfig() config {
 	flag.StringVar(&cfg.DeviceID, "id", defaultID, "device id")
 	flag.StringVar(&cfg.DeviceName, "name", env("LIGHT_AGENT_NAME", hostname), "device display name")
 	flag.StringVar(&cfg.TokenFile, "token-file", env("LIGHT_AGENT_TOKEN_FILE", "data/agent-token"), "file used to persist the device token")
+	flag.StringVar(&cfg.ProvisionKey, "provision-key", env("LIGHT_AGENT_PROVISION_KEY", ""), "enrollment key sent on registration (X-Provision-Key)")
 	heartbeatSeconds := flag.Int("heartbeat", envInt("LIGHT_AGENT_HEARTBEAT_SECONDS", 15), "heartbeat interval in seconds")
 	timeoutSeconds := flag.Int("command-timeout", envInt("LIGHT_AGENT_COMMAND_TIMEOUT_SECONDS", 10), "command execution timeout in seconds")
 	allowed := flag.String("allowed-commands", env("LIGHT_AGENT_ALLOWED_COMMANDS", "uptime,df,free,uname,whoami,pwd,date"), "comma separated shell command allowlist")
@@ -252,6 +254,9 @@ func (a *agent) doJSON(ctx context.Context, method, path, token string, in any, 
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("X-Device-Token", token)
+	}
+	if a.config.ProvisionKey != "" {
+		req.Header.Set("X-Provision-Key", a.config.ProvisionKey) // only enforced on /register
 	}
 	resp, err := a.client.Do(req)
 	if err != nil {

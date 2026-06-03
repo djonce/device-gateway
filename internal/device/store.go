@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"light-gateway/internal/rules"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -40,10 +42,10 @@ const (
 )
 
 type Store struct {
-	mu        sync.RWMutex
-	path      string
-	storage   string
-	db        *sql.DB
+	mu            sync.RWMutex
+	path          string
+	storage       string
+	db            *sql.DB
 	devices       map[string]Device
 	tokens        map[string]DeviceToken
 	telemetry     map[string][]TelemetryPoint
@@ -51,14 +53,24 @@ type Store struct {
 	events        []Event
 	firmwares     map[string]Firmware
 	firmwareBlobs map[string][]byte
+	rules         map[string]rules.Rule
+	enabledRules  int
+	rollups       map[rollupKey]*rollupAgg
 	now           func() time.Time
 	logger        *slog.Logger
+
+	// Cumulative counters (process lifetime), guarded by mu.
+	statRegistrations int64
+	statTelemetry     int64
+	statCommands      int64
+	statAcks          int64
+	statEvents        int64
 }
 
 func NewStore(path string) (*Store, error) {
 	s := &Store{
-		path:      path,
-		storage:   "memory",
+		path:          path,
+		storage:       "memory",
 		devices:       map[string]Device{},
 		tokens:        map[string]DeviceToken{},
 		telemetry:     map[string][]TelemetryPoint{},
@@ -66,6 +78,8 @@ func NewStore(path string) (*Store, error) {
 		events:        []Event{},
 		firmwares:     map[string]Firmware{},
 		firmwareBlobs: map[string][]byte{},
+		rules:         map[string]rules.Rule{},
+		rollups:       map[rollupKey]*rollupAgg{},
 		now:           time.Now,
 		logger:        slog.Default(),
 	}
@@ -154,6 +168,7 @@ func (s *Store) Register(req RegisterDeviceRequest) (DeviceRegistration, error) 
 	s.applyTokenMetadataLocked(&device)
 	s.devices[device.ID] = device
 	s.appendEventLocked("device.registered", device.ID, "device registered", map[string]any{"name": device.Name, "type": device.Type})
+	s.statRegistrations++
 	if err := s.persistDeviceLocked(device); err != nil {
 		return DeviceRegistration{}, err
 	}
@@ -333,11 +348,19 @@ func (s *Store) AddTelemetry(deviceID string, req TelemetryRequest) (TelemetryPo
 	prune := len(points) >= telemetryPerDevice
 	s.telemetry[deviceID] = appendBounded(points, point, telemetryPerDevice)
 	s.appendEventLocked("telemetry.received", deviceID, "telemetry received", map[string]any{"key": point.Key, "value": point.Value})
+	s.statTelemetry++
 	if err := s.persistTelemetryLocked(point, prune); err != nil {
 		return TelemetryPoint{}, err
 	}
 	if point.Key == "gps.fix" {
 		s.evaluateGeofenceLocked(deviceID, point.Value)
+	}
+	if v, ok := toFloat(point.Value); ok {
+		s.updateRollupsLocked(deviceID, point.Key, point.Timestamp, v)
+		if s.enabledRules > 0 {
+			cat := string(s.devices[deviceID].Category)
+			go s.fireRules(rules.Context{Kind: rules.TriggerTelemetry, DeviceID: deviceID, Category: cat, Key: point.Key, Value: v})
+		}
 	}
 	return point, nil
 }
@@ -394,6 +417,7 @@ func (s *Store) CreateCommand(deviceID string, req CreateCommandRequest) (Comman
 	}
 	s.commands[cmd.ID] = cmd
 	s.appendEventLocked("command.created", deviceID, "command queued", map[string]any{"commandId": cmd.ID, "type": cmd.Type})
+	s.statCommands++
 	if err := s.persistCommandLocked(cmd); err != nil {
 		return Command{}, err
 	}
@@ -528,6 +552,7 @@ func (s *Store) AckCommandForDevice(deviceID, commandID string, req AckCommandRe
 	cmd.FinishedAt = &now
 	s.commands[cmd.ID] = cmd
 	s.appendEventLocked("command.ack", cmd.DeviceID, "command acknowledged", map[string]any{"commandId": cmd.ID, "status": cmd.Status})
+	s.statAcks++
 	if err := s.persistCommandLocked(cmd); err != nil {
 		return Command{}, err
 	}
@@ -557,6 +582,7 @@ func (s *Store) RecordEvent(deviceID, eventType, message string, metadata map[st
 }
 
 func (s *Store) appendEventLocked(eventType, deviceID, message string, metadata map[string]any) {
+	s.statEvents++
 	now := s.now().UTC()
 	event := Event{
 		ID:       newID("evt", now),
@@ -570,6 +596,13 @@ func (s *Store) appendEventLocked(eventType, deviceID, message string, metadata 
 	s.events = appendBounded(s.events, event, eventBacklog)
 	if err := s.persistEventLocked(event, prune); err != nil {
 		s.logger.Warn("persist event failed", "error", err, "type", eventType)
+	}
+	if s.enabledRules > 0 && ruleEventAllowed(eventType) {
+		cat := ""
+		if d, ok := s.devices[deviceID]; ok {
+			cat = string(d.Category)
+		}
+		go s.fireRules(rules.Context{Kind: rules.TriggerEvent, DeviceID: deviceID, Category: cat, EventType: eventType})
 	}
 }
 
@@ -603,7 +636,13 @@ func (s *Store) loadSQLite() error {
 	if err := s.loadSQLiteEvents(); err != nil {
 		return err
 	}
-	return s.loadSQLiteFirmware()
+	if err := s.loadSQLiteFirmware(); err != nil {
+		return err
+	}
+	if err := s.loadSQLiteRules(); err != nil {
+		return err
+	}
+	return s.loadSQLiteRollups()
 }
 
 func (s *Store) migrateSQLite() error {
@@ -645,6 +684,23 @@ func (s *Store) migrateSQLite() error {
 			id TEXT PRIMARY KEY,
 			data TEXT NOT NULL,
 			blob BLOB NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS rules (
+			id TEXT PRIMARY KEY,
+			data TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS telemetry_rollup (
+			device_id TEXT NOT NULL,
+			key TEXT NOT NULL,
+			resolution INTEGER NOT NULL,
+			bucket_start INTEGER NOT NULL,
+			count INTEGER NOT NULL,
+			min REAL NOT NULL,
+			max REAL NOT NULL,
+			sum REAL NOT NULL,
+			last REAL NOT NULL,
+			last_ts TEXT NOT NULL,
+			PRIMARY KEY(device_id, key, resolution, bucket_start)
 		)`,
 	}
 	for _, statement := range statements {

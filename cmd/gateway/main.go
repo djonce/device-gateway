@@ -28,6 +28,14 @@ func main() {
 	}
 	defer store.Close()
 
+	// Periodically expire old telemetry rollup buckets per their retention.
+	go func() {
+		store.PruneRollups()
+		for range time.Tick(time.Minute) {
+			store.PruneRollups()
+		}
+	}()
+
 	mux := http.NewServeMux()
 	weatherSvc := weather.NewService(logger)
 	voiceCfg := realtime.PipelineConfig{
@@ -54,7 +62,15 @@ func main() {
 		logger.Warn("admin auth disabled — set LIGHT_ADMIN_PASSWORD to require login for the management API")
 	}
 
-	device.NewAPI(store, logger, weatherSvc, hub, authn).RegisterRoutes(mux)
+	api := device.NewAPI(store, logger, weatherSvc, hub, authn)
+	provisionKey := os.Getenv("LIGHT_PROVISION_KEY")
+	api.SetProvisionKey(provisionKey)
+	if provisionKey != "" {
+		logger.Info("device enrollment restricted — registration requires a provisioning key or admin session")
+	} else {
+		logger.Warn("open device registration — set LIGHT_PROVISION_KEY to require an enrollment key")
+	}
+	api.RegisterRoutes(mux)
 	handler := withCORS(withRequestLog(logger, mux))
 
 	server := &http.Server{

@@ -13,6 +13,7 @@ import type {
   Profile,
   RealtimeStatus,
   RegisterDeviceInput,
+  Rule,
   TelemetryPoint,
   TrackPoint,
 } from './types';
@@ -26,6 +27,8 @@ export interface ClientOptions {
   adminToken?: string;
   /** Device token (device data-plane endpoints). */
   deviceToken?: string;
+  /** Enrollment key sent as X-Provision-Key when registering (if the gateway requires it). */
+  provisionKey?: string;
   /** Inject a fetch implementation (tests, non-browser runtimes). Defaults to global fetch. */
   fetch?: FetchLike;
 }
@@ -50,12 +53,14 @@ export class LightGatewayClient {
   readonly baseUrl: string;
   adminToken: string;
   deviceToken: string;
+  provisionKey: string;
   private fetchImpl: FetchLike;
 
   constructor(opts: ClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, '');
     this.adminToken = opts.adminToken ?? '';
     this.deviceToken = opts.deviceToken ?? '';
+    this.provisionKey = opts.provisionKey ?? '';
     const f = opts.fetch ?? (typeof fetch !== 'undefined' ? (fetch as FetchLike) : undefined);
     if (!f) throw new Error('no fetch implementation available; pass options.fetch');
     this.fetchImpl = f;
@@ -112,9 +117,12 @@ export class LightGatewayClient {
   getDevice(deviceId: string) {
     return this.req<Device>(`/api/v1/devices/${enc(deviceId)}`);
   }
-  /** Device self-registration (open endpoint). Returns a one-time token on first registration. */
+  /** Device self-registration. Returns a one-time token on first registration.
+   * Sends the provisioning key when configured (if the gateway requires it). */
   registerDevice(input: RegisterDeviceInput) {
-    return this.req<DeviceRegistration>('/api/v1/devices/register', { method: 'POST', body: JSON.stringify(input) }, 'none');
+    const headers: Record<string, string> = {};
+    if (this.provisionKey) headers['X-Provision-Key'] = this.provisionKey;
+    return this.req<DeviceRegistration>('/api/v1/devices/register', { method: 'POST', headers, body: JSON.stringify(input) }, 'none');
   }
   resetDeviceToken(deviceId: string) {
     return this.req<DeviceTokenReset>(`/api/v1/devices/${enc(deviceId)}/token/reset`, { method: 'POST' });
@@ -215,6 +223,20 @@ export class LightGatewayClient {
   /** Push a tts.say to a connected voice device. */
   say(deviceId: string, text: string) {
     return this.req<{ ok: boolean }>(`/api/v1/devices/${enc(deviceId)}/realtime/say`, { method: 'POST', body: JSON.stringify({ text }) });
+  }
+
+  // ---- automation rules ----
+  async listRules(): Promise<Rule[]> {
+    return (await this.req<{ items: Rule[] }>('/api/v1/rules')).items;
+  }
+  createRule(rule: Omit<Rule, 'id' | 'createdAt'>) {
+    return this.req<Rule>('/api/v1/rules', { method: 'POST', body: JSON.stringify(rule) });
+  }
+  setRuleEnabled(ruleId: string, enabled: boolean) {
+    return this.req<Rule>(`/api/v1/rules/${enc(ruleId)}/enable`, { method: 'POST', body: JSON.stringify({ enabled }) });
+  }
+  deleteRule(ruleId: string) {
+    return this.req<{ ok: boolean }>(`/api/v1/rules/${enc(ruleId)}`, { method: 'DELETE' });
   }
 
   // ---- ergonomic, profile-aware control helpers ----

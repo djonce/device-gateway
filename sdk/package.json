@@ -11,5 +11,8 @@
     "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js"
   },
   "files": ["dist/src"],
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
   "license": "MIT"
 }
