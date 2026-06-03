@@ -59,6 +59,7 @@ pnpm --dir web build
 | --- | --- | --- |
 | `LIGHT_GATEWAY_ADDR` | `:7001` | 监听地址 |
 | `LIGHT_GATEWAY_DATA` | `data/light-gateway.db` | SQLite 数据文件路径（`""` 为纯内存，仅测试） |
+| `LIGHT_GATEWAY_WEB` | （空=不托管） | 设为管理台 `dist` 目录则网关同进程托管前端（单容器/单进程部署） |
 | `LIGHT_ADMIN_USER` | `admin` | 管理员用户名 |
 | `LIGHT_ADMIN_PASSWORD` | （空=开放模式） | **设置后才强制管理后台登录**；不设则任何人可调运营接口（启动告警） |
 | `LIGHT_PROVISION_KEY` | （空=开放注册） | **设置后才要求设备注册带预配密钥**；不设则任何人可注册设备 |
@@ -179,45 +180,38 @@ gateway.example.com {
 
 nginx 等价要点：`location /api/`、`/health`、`/metrics` `proxy_pass http://127.0.0.1:7001;`，且对 `/api/` 加 `proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`（WebSocket）；其余 `try_files $uri /index.html;` 托管 `web-dist`。
 
-### 6.4 Docker（可选）
+### 6.4 Docker 一键启动（推荐）
 
-网关 `Dockerfile`：
+仓库自带 `Dockerfile`（多阶段：构建管理台 + 编译网关 → distroless 运行时）与 `docker-compose.yml`。**镜像里的网关一个进程就同时服务 API 和管理台**（通过 `LIGHT_GATEWAY_WEB` 托管前端静态），无需再单独跑 Caddy。
 
-```dockerfile
-FROM golang:1.25 AS build
-WORKDIR /src
-COPY . .
-RUN CGO_ENABLED=0 go build -o /light-gateway ./cmd/gateway
-
-FROM gcr.io/distroless/static-debian12
-COPY --from=build /light-gateway /light-gateway
-EXPOSE 7001
-ENTRYPOINT ["/light-gateway"]
+```bash
+cp .env.example .env        # 填上 LIGHT_ADMIN_PASSWORD / LIGHT_PROVISION_KEY
+docker compose up -d --build
+# 打开 http://<主机>:7001  （管理台 + API 同源同端口）
+docker compose logs -f gateway
 ```
 
-`docker-compose.yml`（网关 + Caddy 托管 `web/dist`，先在宿主 `pnpm --dir web build`）：
+- 数据持久化在命名卷 `gwdata`（`/data/light-gateway.db`）；备份即备份该卷。
+- 健康检查用 `light-gateway healthcheck` 子命令（distroless 无 curl，二进制自检 `/health`）。
+- compose 自动读取同目录 `.env`；`.env` 已在 `.dockerignore` 里，不会进镜像。
+
+**生产对外（公网 + TLS）**：上面是单容器、明文 7001，适合内网/家用。要上公网，仍建议前置 TLS——再加一个 Caddy 容器反代 `gateway:7001`（WebSocket 自动升级）：
 
 ```yaml
-services:
-  gateway:
-    build: .
-    environment:
-      LIGHT_GATEWAY_DATA: /data/light-gateway.db
-      LIGHT_ADMIN_PASSWORD: 请改强密码
-      LIGHT_PROVISION_KEY: 请改强密钥
-    volumes:
-      - gwdata:/data
   caddy:
     image: caddy:2
     ports: ["443:443", "80:80"]
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
-      - ./web/dist:/srv/web-dist:ro
       - caddydata:/data
-volumes: { gwdata: {}, caddydata: {} }
+# Caddyfile: gateway.example.com { reverse_proxy gateway:7001 }
 ```
 
-（compose 版 Caddyfile 把 `reverse_proxy @backend gateway:7001`、`root * /srv/web-dist`。）
+此时 Caddy 把所有路径（含 `/api`、`/metrics`、WebSocket、管理台）整体反代到网关即可，因为网关自身已托管前端。
+
+### 6.5 不用 Docker 的单容器替代
+
+非容器环境想要"一个进程服务全部"，给 systemd 的 `gateway.env` 加 `LIGHT_GATEWAY_WEB=/opt/light-gateway/web-dist` 即可——网关会托管管理台，省掉反向代理的静态托管部分（仍建议前置 TLS）。
 
 ---
 

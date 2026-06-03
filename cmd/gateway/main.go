@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -17,6 +18,13 @@ import (
 )
 
 func main() {
+	// `light-gateway healthcheck` probes /health and exits 0/1 (for container
+	// healthchecks on minimal images without curl/wget).
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		healthCheck()
+		return
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	addr := env("LIGHT_GATEWAY_ADDR", ":7001")
 	dataPath := env("LIGHT_GATEWAY_DATA", "data/light-gateway.db")
@@ -71,6 +79,14 @@ func main() {
 		logger.Warn("open device registration — set LIGHT_PROVISION_KEY to require an enrollment key")
 	}
 	api.RegisterRoutes(mux)
+
+	// Optionally serve the built admin console (SPA) so a single container can
+	// serve both the API and the UI. Set LIGHT_GATEWAY_WEB to the dist dir.
+	if webDir := os.Getenv("LIGHT_GATEWAY_WEB"); webDir != "" {
+		mux.Handle("/", spaFileServer(webDir))
+		logger.Info("serving admin console", "dir", webDir)
+	}
+
 	handler := withCORS(withRequestLog(logger, mux))
 
 	server := &http.Server{
@@ -105,6 +121,36 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func healthCheck() {
+	url := env("LIGHT_GATEWAY_HEALTHCHECK_URL", "http://127.0.0.1:7001/health")
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+	resp.Body.Close()
+	os.Exit(0)
+}
+
+// spaFileServer serves static files from dir, falling back to index.html for
+// unknown paths (single-page app routing).
+func spaFileServer(dir string) http.Handler {
+	index := filepath.Join(dir, "index.html")
+	fileServer := http.FileServer(http.Dir(dir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clean := filepath.Clean(r.URL.Path)
+		if clean == "/" || clean == "." {
+			http.ServeFile(w, r, index)
+			return
+		}
+		if info, err := os.Stat(filepath.Join(dir, clean)); err != nil || info.IsDir() {
+			http.ServeFile(w, r, index) // SPA fallback
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	})
 }
 
 func withRequestLog(logger *slog.Logger, next http.Handler) http.Handler {

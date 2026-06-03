@@ -310,6 +310,16 @@ scripts/test-all.sh
 
 ## 安装部署
 
+**一键安装启动**（需要 Docker；网关一个容器同时服务 API + 管理台，端口 7001）：
+
+```bash
+scripts/start.sh        # 等价于 docker compose up -d --build
+```
+
+零配置即可启动，开箱默认登录 **admin / lightgateway**（设备预配密钥 `lightgateway-enroll`）。打开 http://localhost:7001 即用。
+
+> 生产部署务必改默认密码：建一个 `.env` 写 `LIGHT_ADMIN_PASSWORD=...` 和 `LIGHT_PROVISION_KEY=...` 再重跑；并按文档前置 TLS。
+
 完整的构建、配置、生产部署（systemd + 反向代理 + TLS + Docker）、设备接入与运维指南见 [docs/deployment.md](docs/deployment.md)。
 
 ## 设计文档
