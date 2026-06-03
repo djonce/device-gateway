@@ -56,6 +56,7 @@ type Store struct {
 	rules         map[string]rules.Rule
 	enabledRules  int
 	rollups       map[rollupKey]*rollupAgg
+	apiKeys       map[string]APIKey
 	now           func() time.Time
 	logger        *slog.Logger
 
@@ -80,6 +81,7 @@ func NewStore(path string) (*Store, error) {
 		firmwareBlobs: map[string][]byte{},
 		rules:         map[string]rules.Rule{},
 		rollups:       map[rollupKey]*rollupAgg{},
+		apiKeys:       map[string]APIKey{},
 		now:           time.Now,
 		logger:        slog.Default(),
 	}
@@ -642,7 +644,10 @@ func (s *Store) loadSQLite() error {
 	if err := s.loadSQLiteRules(); err != nil {
 		return err
 	}
-	return s.loadSQLiteRollups()
+	if err := s.loadSQLiteRollups(); err != nil {
+		return err
+	}
+	return s.loadSQLiteAPIKeys()
 }
 
 func (s *Store) migrateSQLite() error {
@@ -701,6 +706,13 @@ func (s *Store) migrateSQLite() error {
 			last REAL NOT NULL,
 			last_ts TEXT NOT NULL,
 			PRIMARY KEY(device_id, key, resolution, bucket_start)
+		)`,
+		`CREATE TABLE IF NOT EXISTS api_keys (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			role TEXT NOT NULL,
+			key_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL
 		)`,
 	}
 	for _, statement := range statements {

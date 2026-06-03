@@ -46,6 +46,50 @@ func TestRegisterRequiresProvisionKey(t *testing.T) {
 	}
 }
 
+func TestRoleEnforcementWithAPIKeys(t *testing.T) {
+	store, _ := NewStore("")
+	store.Register(RegisterDeviceRequest{ID: "d1", Name: "D1", Type: DeviceTypeESP, Category: CategoryLight})
+	authn := auth.New("admin", "pw")
+	api := NewAPI(store, nil, nil, nil, authn)
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	_, viewerKey, _ := store.CreateAPIKey("dashboard", "viewer")
+	_, operatorKey, _ := store.CreateAPIKey("automation", "operator")
+
+	do := func(method, path, bearer, body string) int {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	cmdBody := `{"type":"light.power","payload":{"on":true}}`
+	cases := []struct {
+		name             string
+		method, path     string
+		bearer           string
+		body             string
+		want             int
+	}{
+		{"no token -> 401", http.MethodGet, "/api/v1/devices", "", "", http.StatusUnauthorized},
+		{"viewer can list", http.MethodGet, "/api/v1/devices", viewerKey, "", http.StatusOK},
+		{"viewer cannot command", http.MethodPost, "/api/v1/devices/d1/commands", viewerKey, cmdBody, http.StatusForbidden},
+		{"operator can command", http.MethodPost, "/api/v1/devices/d1/commands", operatorKey, cmdBody, http.StatusCreated},
+		{"viewer cannot manage keys", http.MethodGet, "/api/v1/apikeys", viewerKey, "", http.StatusForbidden},
+		{"operator cannot manage keys", http.MethodGet, "/api/v1/apikeys", operatorKey, "", http.StatusForbidden},
+		{"bad key -> 401", http.MethodGet, "/api/v1/devices", "lgwk_bogus", "", http.StatusUnauthorized},
+	}
+	for _, c := range cases {
+		if got := do(c.method, c.path, c.bearer, c.body); got != c.want {
+			t.Fatalf("%s: expected %d, got %d", c.name, c.want, got)
+		}
+	}
+}
+
 func TestRegisterAllowsAdminSession(t *testing.T) {
 	store, _ := NewStore("")
 	authn := auth.New("admin", "pw")

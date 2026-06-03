@@ -101,6 +101,23 @@ test('registerDevice sends the provisioning key header when set', async () => {
   assert.equal(headerOf(cap[0]!, 'X-Provision-Key'), 'enroll-secret');
 });
 
+test('createApiKey posts name + role', async () => {
+  const cap: Captured[] = [];
+  const client = new LightGatewayClient({ baseUrl: 'http://gw:7001', adminToken: 'ADM', fetch: fakeFetch({ id: 'key-1', name: 'ci', role: 'operator', key: 'lgwk_x', createdAt: '' }, cap) });
+  const res = await client.createApiKey('ci', 'operator');
+  assert.equal(res.key, 'lgwk_x');
+  assert.equal(cap[0]!.url, 'http://gw:7001/api/v1/apikeys');
+  assert.deepEqual(JSON.parse(cap[0]!.init!.body as string), { name: 'ci', role: 'operator' });
+});
+
+test('a client can authenticate with an API key as its token', async () => {
+  const cap: Captured[] = [];
+  // Machines use an API key as the bearer token; its role gates access server-side.
+  const client = new LightGatewayClient({ baseUrl: 'http://gw:7001', adminToken: 'lgwk_operatorkey', fetch: fakeFetch({ items: [] }, cap) });
+  await client.listDevices();
+  assert.equal(headerOf(cap[0]!, 'Authorization'), 'Bearer lgwk_operatorkey');
+});
+
 test('createRule posts the rule definition', async () => {
   const cap: Captured[] = [];
   const client = new LightGatewayClient({ baseUrl: 'http://gw:7001', adminToken: 'ADM', fetch: fakeFetch({ id: 'rule-1' }, cap) });

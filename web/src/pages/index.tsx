@@ -39,8 +39,10 @@ import {
 	TelemetryPoint,
 	TrackPoint,
 	authStatus,
+	createApiKey,
 	createCommand,
 	createRule,
+	deleteApiKey,
 	deleteRule,
 	getClockContent,
 	getRealtimeStatus,
@@ -54,12 +56,15 @@ import {
 	type RuleAction,
 	type RuleTrigger,
 	type TelemetryBucket,
+	listApiKeys,
   listCommands,
   listDevices,
 	listEvents,
 	listFirmware,
 	listRules,
 	listTelemetry,
+	type ApiKey,
+	type Role,
 	login,
 	logout,
 	registerDemoDevice,
@@ -502,6 +507,7 @@ export default function HomePage() {
 
         {stats && <FleetDashboard stats={stats} />}
         {authed && <AutomationPanel />}
+        {authed && authRequired && <ApiKeysPanel />}
 
         {selected ? (
           <div className="contentGrid">
@@ -1316,6 +1322,95 @@ function OtaPanel({ device, onChanged }: { device: Device; onChanged: () => void
           上传固件（{device.category}）
         </button>
         {localError && <span className="fieldError">{localError}</span>}
+      </div>
+    </section>
+  );
+}
+
+function ApiKeysPanel() {
+  const [keys, setKeys] = useState<ApiKey[]>([]);
+  const [name, setName] = useState('');
+  const [role, setRole] = useState<Role>('viewer');
+  const [created, setCreated] = useState<{ name: string; key: string } | null>(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function reload() {
+    try {
+      setKeys((await listApiKeys()).items);
+    } catch {
+      /* ignore */
+    }
+  }
+  useEffect(() => {
+    reload();
+  }, []);
+
+  async function create() {
+    if (!name.trim()) {
+      setError('密钥需要名称');
+      return;
+    }
+    setError('');
+    setBusy(true);
+    try {
+      const res = await createApiKey(name.trim(), role);
+      setCreated({ name: res.name, key: res.key });
+      setName('');
+      await reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '创建失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function remove(id: string) {
+    await deleteApiKey(id);
+    await reload();
+  }
+
+  return (
+    <section className="panel">
+      <PanelTitle icon={<KeyRound size={18} />} title="API 密钥" />
+      <div className="formGrid">
+        <span className="fieldHint">给脚本 / CI / 看板用的长期密钥，绑角色（viewer 只读 · operator 可操作 · admin 全权）。把密钥作为 Bearer Token 即可。</span>
+        {keys.map((k) => (
+          <div key={k.id} className="formMeta">
+            <span>
+              <strong>{k.name}</strong> · {k.role}
+            </span>
+            <span>{formatTime(k.createdAt)}</span>
+            <button type="button" className="linkButton" onClick={() => remove(k.id)}>
+              吊销
+            </button>
+          </div>
+        ))}
+
+        <div className="formMeta">
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="密钥名称" style={{ width: 160 }} />
+          <select value={role} onChange={(e) => setRole(e.target.value as Role)}>
+            <option value="viewer">viewer</option>
+            <option value="operator">operator</option>
+            <option value="admin">admin</option>
+          </select>
+          <button type="button" className="primaryButton" onClick={create} disabled={busy}>
+            {busy ? <Loader2 size={16} className="spin" /> : <KeyRound size={16} />}
+            新建密钥
+          </button>
+        </div>
+        {error && <span className="fieldError">{error}</span>}
+        {created && (
+          <div className="secretBox">
+            <div>
+              <strong>{created.name} 的密钥（仅显示一次）</strong>
+              <small>立即复制保存，关闭后无法再查看。</small>
+            </div>
+            <code>{created.key}</code>
+            <button type="button" className="iconButton" title="复制" onClick={() => navigator.clipboard?.writeText(created.key)}>
+              <Copy size={16} />
+            </button>
+          </div>
+        )}
       </div>
     </section>
   );

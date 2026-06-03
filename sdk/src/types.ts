@@ -216,6 +216,15 @@ export interface Rule {
   createdAt: string;
 }
 
+export type Role = 'viewer' | 'operator' | 'admin';
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  role: Role;
+  createdAt: string;
+}
+
 // Realtime voice envelope (lightgw.voice.v0).
 export interface VoiceEnvelope {
   type: string;

@@ -43,7 +43,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /metrics", a.metrics)
 	mux.HandleFunc("GET /api/v1/auth/status", a.authStatus)
 	mux.HandleFunc("POST /api/v1/auth/login", a.login)
-	mux.HandleFunc("POST /api/v1/auth/logout", a.admin(a.logout))
+	mux.HandleFunc("POST /api/v1/auth/logout", a.viewer(a.logout))
 	mux.HandleFunc("GET /api/v1/content/clock", a.clockContent)
 	mux.HandleFunc("POST /api/v1/devices/register", a.registerDevice)
 
@@ -56,47 +56,81 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/devices/{deviceID}/ota", a.otaStatus)
 	mux.HandleFunc("GET /api/v1/devices/{deviceID}/firmware/{firmwareID}/download", a.downloadFirmware)
 
-	// Admin-authenticated: the operator/console control plane.
-	mux.HandleFunc("GET /api/v1/profiles", a.admin(a.listProfiles))
-	mux.HandleFunc("GET /api/v1/devices", a.admin(a.listDevices))
-	mux.HandleFunc("GET /api/v1/devices/{deviceID}", a.admin(a.getDevice))
-	mux.HandleFunc("POST /api/v1/devices/{deviceID}/token/reset", a.admin(a.resetDeviceToken))
-	mux.HandleFunc("POST /api/v1/devices/{deviceID}/status", a.admin(a.updateDeviceStatus))
-	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry", a.admin(a.listTelemetry))
-	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry/series", a.admin(a.telemetrySeries))
-	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry/history", a.admin(a.telemetryHistory))
-	mux.HandleFunc("GET /api/v1/stats", a.admin(a.stats))
-	mux.HandleFunc("POST /api/v1/devices/{deviceID}/geofence", a.admin(a.setGeofence))
-	mux.HandleFunc("GET /api/v1/devices/{deviceID}/track", a.admin(a.listTrack))
-	mux.HandleFunc("POST /api/v1/devices/{deviceID}/commands", a.admin(a.createCommand))
-	mux.HandleFunc("GET /api/v1/devices/{deviceID}/commands", a.admin(a.listCommands))
-	mux.HandleFunc("GET /api/v1/devices/{deviceID}/realtime", a.admin(a.realtimeStatus))
-	mux.HandleFunc("POST /api/v1/devices/{deviceID}/realtime/say", a.admin(a.realtimeSay))
-	mux.HandleFunc("POST /api/v1/devices/{deviceID}/ota/target", a.admin(a.setOtaTarget))
-	mux.HandleFunc("GET /api/v1/events", a.admin(a.listEvents))
-	mux.HandleFunc("POST /api/v1/firmware", a.admin(a.uploadFirmware))
-	mux.HandleFunc("GET /api/v1/firmware", a.admin(a.listFirmware))
-	mux.HandleFunc("POST /api/v1/firmware/{firmwareID}/rollout", a.admin(a.rolloutFirmware))
-	mux.HandleFunc("GET /api/v1/rules", a.admin(a.listRules))
-	mux.HandleFunc("POST /api/v1/rules", a.admin(a.createRule))
-	mux.HandleFunc("POST /api/v1/rules/{ruleID}/enable", a.admin(a.setRuleEnabled))
-	mux.HandleFunc("DELETE /api/v1/rules/{ruleID}", a.admin(a.deleteRule))
+	// Read-only (viewer+): dashboards, listings, history.
+	mux.HandleFunc("GET /api/v1/profiles", a.viewer(a.listProfiles))
+	mux.HandleFunc("GET /api/v1/devices", a.viewer(a.listDevices))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}", a.viewer(a.getDevice))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry", a.viewer(a.listTelemetry))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry/series", a.viewer(a.telemetrySeries))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}/telemetry/history", a.viewer(a.telemetryHistory))
+	mux.HandleFunc("GET /api/v1/stats", a.viewer(a.stats))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}/track", a.viewer(a.listTrack))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}/commands", a.viewer(a.listCommands))
+	mux.HandleFunc("GET /api/v1/devices/{deviceID}/realtime", a.viewer(a.realtimeStatus))
+	mux.HandleFunc("GET /api/v1/events", a.viewer(a.listEvents))
+	mux.HandleFunc("GET /api/v1/firmware", a.viewer(a.listFirmware))
+	mux.HandleFunc("GET /api/v1/rules", a.viewer(a.listRules))
+
+	// Write (operator+): commands, config, OTA, rules.
+	mux.HandleFunc("POST /api/v1/devices/{deviceID}/token/reset", a.operator(a.resetDeviceToken))
+	mux.HandleFunc("POST /api/v1/devices/{deviceID}/status", a.operator(a.updateDeviceStatus))
+	mux.HandleFunc("POST /api/v1/devices/{deviceID}/geofence", a.operator(a.setGeofence))
+	mux.HandleFunc("POST /api/v1/devices/{deviceID}/commands", a.operator(a.createCommand))
+	mux.HandleFunc("POST /api/v1/devices/{deviceID}/realtime/say", a.operator(a.realtimeSay))
+	mux.HandleFunc("POST /api/v1/devices/{deviceID}/ota/target", a.operator(a.setOtaTarget))
+	mux.HandleFunc("POST /api/v1/firmware", a.operator(a.uploadFirmware))
+	mux.HandleFunc("POST /api/v1/firmware/{firmwareID}/rollout", a.operator(a.rolloutFirmware))
+	mux.HandleFunc("POST /api/v1/rules", a.operator(a.createRule))
+	mux.HandleFunc("POST /api/v1/rules/{ruleID}/enable", a.operator(a.setRuleEnabled))
+	mux.HandleFunc("DELETE /api/v1/rules/{ruleID}", a.operator(a.deleteRule))
+
+	// Admin only: API key management.
+	mux.HandleFunc("GET /api/v1/apikeys", a.adminOnly(a.listAPIKeys))
+	mux.HandleFunc("POST /api/v1/apikeys", a.adminOnly(a.createAPIKey))
+	mux.HandleFunc("DELETE /api/v1/apikeys/{keyID}", a.adminOnly(a.deleteAPIKey))
 }
 
-// admin wraps an operator endpoint with admin-session auth. In open mode (no
-// admin password configured) it passes through.
-func (a *API) admin(h http.HandlerFunc) http.HandlerFunc {
+func (a *API) viewer(h http.HandlerFunc) http.HandlerFunc    { return a.require(auth.RoleViewer, h) }
+func (a *API) operator(h http.HandlerFunc) http.HandlerFunc  { return a.require(auth.RoleOperator, h) }
+func (a *API) adminOnly(h http.HandlerFunc) http.HandlerFunc { return a.require(auth.RoleAdmin, h) }
+
+// require gates an endpoint on a minimum role, resolving the caller's role from
+// a session token or API key. In open mode (no admin password) it passes through.
+func (a *API) require(min auth.Role, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if a.auth == nil || !a.auth.Enabled() {
 			h(w, r)
 			return
 		}
-		if !a.auth.Validate(a.bearerToken(r)) {
-			writeError(w, http.StatusUnauthorized, "admin authentication required")
+		role, ok := a.callerRole(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		if !role.Allows(min) {
+			writeError(w, http.StatusForbidden, "insufficient role: need "+string(min))
 			return
 		}
 		h(w, r)
 	}
+}
+
+// callerRole resolves the bearer token to a role: a session token first, then
+// an API key.
+func (a *API) callerRole(r *http.Request) (auth.Role, bool) {
+	bearer := a.bearerToken(r)
+	if bearer == "" {
+		return "", false
+	}
+	if a.auth != nil {
+		if role, ok := a.auth.Validate(bearer); ok {
+			return role, true
+		}
+	}
+	if role, ok := a.store.VerifyAPIKey(bearer); ok {
+		return auth.Role(role), true
+	}
+	return "", false
 }
 
 func (a *API) bearerToken(r *http.Request) string {
@@ -128,7 +162,38 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"token": token, "expiresAt": expiresAt})
+	writeJSON(w, http.StatusOK, map[string]any{"token": token, "expiresAt": expiresAt, "role": string(auth.RoleAdmin)})
+}
+
+func (a *API) listAPIKeys(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"items": a.store.ListAPIKeys()})
+}
+
+func (a *API) createAPIKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		Role string `json:"role"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	key, plaintext, err := a.store.CreateAPIKey(req.Name, req.Role)
+	if err != nil {
+		respond(w, nil, err, http.StatusOK)
+		return
+	}
+	// Plaintext key is returned exactly once.
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id": key.ID, "name": key.Name, "role": key.Role, "key": plaintext, "createdAt": key.CreatedAt,
+	})
+}
+
+func (a *API) deleteAPIKey(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.DeleteAPIKey(r.PathValue("keyID")); err != nil {
+		respond(w, nil, err, http.StatusOK)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (a *API) logout(w http.ResponseWriter, r *http.Request) {
@@ -268,7 +333,13 @@ func (a *API) allowRegister(r *http.Request) bool {
 	if key != "" && subtle.ConstantTimeCompare([]byte(key), []byte(a.provisionKey)) == 1 {
 		return true
 	}
-	return a.auth != nil && a.auth.Enabled() && a.auth.Validate(a.bearerToken(r))
+	// Fall back to an operator+ session or API key (console / admin can register).
+	if a.auth != nil && a.auth.Enabled() {
+		if role, ok := a.callerRole(r); ok && role.Allows(auth.RoleOperator) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *API) registerDevice(w http.ResponseWriter, r *http.Request) {

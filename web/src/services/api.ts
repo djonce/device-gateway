@@ -303,6 +303,28 @@ export function deleteRule(ruleId: string) {
   return request<{ ok: boolean }>(`/api/v1/rules/${encodeURIComponent(ruleId)}`, { method: 'DELETE' });
 }
 
+export type Role = 'viewer' | 'operator' | 'admin';
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  role: Role;
+  createdAt: string;
+}
+
+export function listApiKeys() {
+  return request<{ items: ApiKey[] }>('/api/v1/apikeys');
+}
+export function createApiKey(name: string, role: Role) {
+  return request<ApiKey & { key: string }>('/api/v1/apikeys', {
+    method: 'POST',
+    body: JSON.stringify({ name, role }),
+  });
+}
+export function deleteApiKey(id: string) {
+  return request<{ ok: boolean }>(`/api/v1/apikeys/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
 export interface TelemetryBucket {
   t: string;
   count: number;

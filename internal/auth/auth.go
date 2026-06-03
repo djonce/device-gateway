@@ -1,10 +1,12 @@
-// Package auth provides simple admin authentication for the management API.
+// Package auth provides admin authentication and role vocabulary for the
+// management API.
 //
-// A single admin account is configured from the environment (no user database).
-// Login compares credentials in constant time and issues a random session token;
-// only the token's SHA-256 hash is kept in memory, with an expiry. If no
-// password is configured the authenticator runs in "open mode" (auth disabled)
-// for local development — the gateway logs a warning in that case.
+// A single admin account is configured from the environment (no user database);
+// logging in issues a short-lived session token bound to the admin role. Roles
+// (viewer < operator < admin) are also used by API keys (stored by the device
+// package) to give scoped, long-lived programmatic access. If no password is
+// configured the gateway runs in "open mode" — that gate is enforced in the API
+// layer, not here.
 package auth
 
 import (
@@ -16,6 +18,46 @@ import (
 	"time"
 )
 
+// Role is an access level. Higher roles include lower-role permissions.
+type Role string
+
+const (
+	RoleViewer   Role = "viewer"
+	RoleOperator Role = "operator"
+	RoleAdmin    Role = "admin"
+)
+
+func (r Role) rank() int {
+	switch r {
+	case RoleViewer:
+		return 1
+	case RoleOperator:
+		return 2
+	case RoleAdmin:
+		return 3
+	}
+	return 0
+}
+
+// Allows reports whether this role satisfies a required minimum role.
+func (r Role) Allows(min Role) bool {
+	return r.rank() > 0 && r.rank() >= min.rank()
+}
+
+// ValidRole reports whether s names a known role.
+func ValidRole(s string) bool {
+	switch Role(s) {
+	case RoleViewer, RoleOperator, RoleAdmin:
+		return true
+	}
+	return false
+}
+
+type session struct {
+	role      Role
+	expiresAt time.Time
+}
+
 // Authenticator manages the admin account and active sessions.
 type Authenticator struct {
 	user     string
@@ -25,7 +67,7 @@ type Authenticator struct {
 	now      func() time.Time
 
 	mu       sync.Mutex
-	sessions map[string]time.Time // sha256(token) -> expiry
+	sessions map[string]session // sha256(token) -> session
 }
 
 // New builds an authenticator. Auth is enabled only when a password is set.
@@ -40,7 +82,7 @@ func New(user, password string) *Authenticator {
 		enabled:  password != "",
 		ttl:      24 * time.Hour,
 		now:      time.Now,
-		sessions: map[string]time.Time{},
+		sessions: map[string]session{},
 	}
 }
 
@@ -52,7 +94,8 @@ func hashToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Login validates credentials (constant time) and returns a new session token.
+// Login validates the admin account (constant time) and returns an admin
+// session token.
 func (a *Authenticator) Login(user, password string) (string, time.Time, bool) {
 	if !a.enabled {
 		return "", time.Time{}, false
@@ -70,33 +113,29 @@ func (a *Authenticator) Login(user, password string) (string, time.Time, bool) {
 	expiresAt := a.now().Add(a.ttl)
 
 	a.mu.Lock()
-	a.sessions[hashToken(token)] = expiresAt
+	a.sessions[hashToken(token)] = session{role: RoleAdmin, expiresAt: expiresAt}
 	a.pruneLocked()
 	a.mu.Unlock()
 	return token, expiresAt, true
 }
 
-// Validate reports whether a session token is currently valid. In open mode
-// (auth disabled) it always returns true.
-func (a *Authenticator) Validate(token string) bool {
-	if !a.enabled {
-		return true
-	}
+// Validate returns the role bound to a valid session token.
+func (a *Authenticator) Validate(token string) (Role, bool) {
 	if token == "" {
-		return false
+		return "", false
 	}
 	key := hashToken(token)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	expiresAt, ok := a.sessions[key]
+	s, ok := a.sessions[key]
 	if !ok {
-		return false
+		return "", false
 	}
-	if a.now().After(expiresAt) {
+	if a.now().After(s.expiresAt) {
 		delete(a.sessions, key)
-		return false
+		return "", false
 	}
-	return true
+	return s.role, true
 }
 
 // Logout invalidates a session token.
@@ -108,8 +147,8 @@ func (a *Authenticator) Logout(token string) {
 
 func (a *Authenticator) pruneLocked() {
 	now := a.now()
-	for key, expiresAt := range a.sessions {
-		if now.After(expiresAt) {
+	for key, s := range a.sessions {
+		if now.After(s.expiresAt) {
 			delete(a.sessions, key)
 		}
 	}

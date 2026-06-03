@@ -1,5 +1,6 @@
 import type {
   AckCommandInput,
+  ApiKey,
   ClockContent,
   Command,
   CreateCommandInput,
@@ -237,6 +238,19 @@ export class LightGatewayClient {
   }
   deleteRule(ruleId: string) {
     return this.req<{ ok: boolean }>(`/api/v1/rules/${enc(ruleId)}`, { method: 'DELETE' });
+  }
+
+  // ---- API keys (admin) ----
+  // A created key can be used as the bearer token by a machine: construct a
+  // client with { adminToken: <apiKey> } and its role gates what it can call.
+  async listApiKeys(): Promise<ApiKey[]> {
+    return (await this.req<{ items: ApiKey[] }>('/api/v1/apikeys')).items;
+  }
+  createApiKey(name: string, role: 'viewer' | 'operator' | 'admin') {
+    return this.req<ApiKey & { key: string }>('/api/v1/apikeys', { method: 'POST', body: JSON.stringify({ name, role }) });
+  }
+  deleteApiKey(id: string) {
+    return this.req<{ ok: boolean }>(`/api/v1/apikeys/${enc(id)}`, { method: 'DELETE' });
   }
 
   // ---- ergonomic, profile-aware control helpers ----

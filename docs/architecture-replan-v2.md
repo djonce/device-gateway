@@ -461,5 +461,21 @@ type Device struct {
 
 **权衡说明**：内存 rollup map 受保留上界约束（每设备每指标 ~4k 桶），小/中规模无虑；超大规模或需 Grafana/HA 时，可另加"每设备遥测 → Prometheus 带标签指标"导出作为可选升级路径，不绑死架构。
 
+## 24. 操作员角色 + API 密钥（轻量 RBAC，已落地）
+
+把"管理员全权 / 其余无权"细化为**角色 + 每接口最小角色**，并加机器用的 API 密钥（仍零依赖）。
+
+**角色**（`internal/auth`）：`viewer < operator < admin`，`Role.Allows(min)` 判层级；会话带角色，`Validate` 返回 `(Role, bool)`。交互式管理员登录即 admin。
+
+**API 密钥**（新增 `internal/device/apikeys.go` + `api_keys` 表）：`CreateAPIKey`（绑角色、存 SHA-256 哈希、明文 `lgwk_…` 只返一次）、`ListAPIKeys`（哈希 `json:"-"` 不外泄）、`VerifyAPIKey`、`DeleteAPIKey`。
+
+**路由分级**（`api.go`）：`a.admin(h)` 换成 `a.require(min, h)` + `viewer/operator/adminOnly` 包装——读接口 viewer、写接口 operator、密钥管理 admin。`callerRole` 先按会话 Token 解析、再按 API 密钥解析（机器把 key 当 Bearer）。开放模式（未设管理员密码）仍全放行。`register` 的会话回退改为 operator+。
+
+**控制台 / SDK**：管理台「API 密钥」面板（建/列/吊销，新密钥明文一次性显示）；SDK `createApiKey/listApiKeys/deleteApiKey`，且 `adminToken` 处填 API 密钥即可用 key 鉴权。
+
+**验证**：`auth` 角色层级/会话/过期单测；API 层角色强制单测（无 token 401、viewer 列设备 200、viewer 下命令 403、operator 下命令 201、viewer/operator 访问密钥管理 403、坏 key 401）；Store 级密钥单测（非法角色拒绝、校验、JSON 不泄哈希、吊销后失效）；SDK `npm test` 14/14；`web typecheck` 通过。
+
+**范围说明**：这是"轻量档"——保留单交互管理员 + 角色化 API 密钥，未引入多用户账号（users 表 / 用户管理 UI / 改密）。多人协作、审计到人的完整多用户 RBAC 可作为后续扩展。
+
 ---
 *本文档基于当前仓库代码（`internal/device`、`cmd/*`、`firmware/esp32-wifi-agent`、`web`）梳理，与 `docs/access-model.md` 的接入模型一脉相承，作为其 v2 演进规划。第 9 节为阶段 0 已实现内容。*

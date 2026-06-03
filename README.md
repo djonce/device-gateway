@@ -252,6 +252,20 @@ LIGHT_ADMIN_USER=admin LIGHT_ADMIN_PASSWORD=请改成强密码 go run ./cmd/gate
 
 > 注意：`scripts/smoke.sh` 默认针对开放模式；若启用了管理员鉴权，命令创建等运营接口需要带 Token。
 
+## 角色 + API 密钥（RBAC，轻量）
+
+运营接口按**角色**分级（在管理员鉴权启用时生效）：
+
+- **viewer**：只读（设备/遥测/趋势/事件/仪表盘/轨迹/列表）。
+- **operator**：viewer + 写操作（下发命令、设围栏、OTA 设目标/灰度、规则增删、固件上传、启停、重置设备 Token）。
+- **admin**：operator + 管 API 密钥。
+
+交互式管理员（`LIGHT_ADMIN_*`）登录即 admin 角色。**API 密钥**给机器用（脚本/CI/看板/集成）：管理员创建、绑角色、可吊销，明文只在创建时返回一次，存哈希。把密钥当 `Authorization: Bearer <key>` 即可，其角色决定能调哪些接口。
+
+- 接口：`GET/POST /api/v1/apikeys`（admin）、`DELETE /api/v1/apikeys/{id}`（admin）。
+- 管理台「API 密钥」面板：建（选角色）/ 列 / 吊销，新密钥明文一次性显示。
+- SDK：`client.createApiKey/listApiKeys/deleteApiKey`；机器侧 `new LightGatewayClient({ baseUrl, adminToken: <apiKey> })` 即可用 key 鉴权。
+
 ## 能力档案
 
 `GET /api/v1/profiles` 返回内置能力档案（`light.v1 / clock.v1 / gps.v1 / voice.v1`）。设备注册时带 `category`（如 `light`）会自动绑定默认档案，平台据此校验命令类型，管理台据此渲染对应控制面板。无档案的设备（如串口/Linux 桥接 Agent）不受命令限制。
@@ -294,6 +308,10 @@ BASE_URL=http://127.0.0.1:7001 scripts/smoke.sh
 scripts/test-all.sh
 ```
 
+## 安装部署
+
+完整的构建、配置、生产部署（systemd + 反向代理 + TLS + Docker）、设备接入与运维指南见 [docs/deployment.md](docs/deployment.md)。
+
 ## 设计文档
 
-设备接入模型、协议决策和后续扩展点见 [docs/access-model.md](docs/access-model.md)。
+设备接入模型、协议决策和后续扩展点见 [docs/access-model.md](docs/access-model.md)；整体架构与各阶段演进见 [docs/architecture-replan-v2.md](docs/architecture-replan-v2.md)；实时语音协议见 [docs/realtime-voice.md](docs/realtime-voice.md)。
