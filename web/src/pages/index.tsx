@@ -19,6 +19,7 @@ import {
 	Power,
 	RadioTower,
 	RefreshCw,
+	Search,
 	Send,
 	ShieldOff,
 	Smartphone,
@@ -174,6 +175,8 @@ export default function HomePage() {
   const [loggingIn, setLoggingIn] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedId, setSelectedId] = useState<string>('');
+  const [deviceQuery, setDeviceQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('all');
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
   const [commands, setCommands] = useState<Command[]>([]);
   const [events, setEvents] = useState<GatewayEvent[]>([]);
@@ -211,6 +214,30 @@ export default function HomePage() {
     () => Array.from(new Set(telemetry.filter((point) => typeof point.value === 'number').map((point) => point.key))),
     [telemetry],
   );
+  const categories = useMemo(
+    () => Array.from(new Set(devices.map((device) => device.category).filter(Boolean))) as string[],
+    [devices],
+  );
+  const visibleDevices = useMemo(() => {
+    const q = deviceQuery.trim().toLowerCase();
+    const rank: Record<string, number> = { online: 0, stale: 1, offline: 2 };
+    return devices
+      .filter((device) => categoryFilter === 'all' || device.category === categoryFilter)
+      .filter(
+        (device) =>
+          !q ||
+          device.name.toLowerCase().includes(q) ||
+          device.id.toLowerCase().includes(q) ||
+          (device.category ?? '').toLowerCase().includes(q),
+      )
+      .slice()
+      .sort((a, b) => {
+        const ra = a.disabled ? 9 : rank[a.state] ?? 3;
+        const rb = b.disabled ? 9 : rank[b.state] ?? 3;
+        if (ra !== rb) return ra - rb;
+        return a.name.localeCompare(b.name);
+      });
+  }, [devices, deviceQuery, categoryFilter]);
 
   async function refresh(deviceId?: string, options: { silent?: boolean } = {}) {
     if (!options.silent) {
@@ -312,7 +339,7 @@ export default function HomePage() {
     try {
       await createCommand(selected.id, { type, payload, ttlSeconds: 120 });
       await refresh(selected.id);
-      setNotice(`${type} 已下发给 ${selected.name}`);
+      setNotice(`已下发 ${type} → ${selected.name}，等待设备确认…`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Command failed');
     } finally {
@@ -383,7 +410,7 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!authed || !autoRefresh) return undefined;
-    const timer = window.setInterval(() => refresh(selectedId, { silent: true }), 8000);
+    const timer = window.setInterval(() => refresh(selectedId, { silent: true }), 4000);
     return () => window.clearInterval(timer);
   }, [authed, autoRefresh, selectedId]);
 
@@ -393,9 +420,18 @@ export default function HomePage() {
 
   if (authRequired && !authed) {
     return (
-      <main className="loginShell" style={{ display: 'grid', placeItems: 'center', minHeight: '100vh' }}>
-        <form className="panel" style={{ width: 320, padding: 24 }} onSubmit={submitLogin}>
-          <PanelTitle icon={<KeyRound size={18} />} title="管理后台登录" />
+      <main className="loginShell">
+        <form className="panel loginPanel" onSubmit={submitLogin}>
+          <div className="loginHeader">
+            <div className="brandMark">
+              <RadioTower size={22} />
+            </div>
+            <div>
+              <span className="eyebrow">Secure console</span>
+              <h1>Light Gateway</h1>
+              <p>管理后台登录</p>
+            </div>
+          </div>
           <div className="formGrid">
             <label>
               用户名
@@ -430,23 +466,23 @@ export default function HomePage() {
           </div>
           <div>
             <h1>Light Gateway</h1>
-            <p>Device control plane</p>
+            <p>设备接入控制台</p>
           </div>
         </div>
 
         <div className="metricGrid">
-          <Metric label="Online" value={counts.online} tone="good" />
-          <Metric label="Stale" value={counts.stale} tone="warn" />
-          <Metric label="Disabled" value={counts.disabled} tone="bad" />
+          <Metric label="在线" value={counts.online} tone="good" />
+          <Metric label="弱网" value={counts.stale} tone="warn" />
+          <Metric label="禁用" value={counts.disabled} tone="bad" />
         </div>
 
         <div className="toolbar">
-          <button type="button" className="iconButton" onClick={() => refresh(selected?.id)} title="Refresh devices" disabled={loading}>
+          <button type="button" className="iconButton" onClick={() => refresh(selected?.id)} title="刷新设备" disabled={loading}>
             <RefreshCw size={18} className={loading ? 'spin' : ''} />
           </button>
           <button type="button" className="textButton" onClick={seedDemoDevices} disabled={loading}>
             <Plus size={16} />
-            Seed Demo
+            演示数据
           </button>
           {authRequired && (
             <button type="button" className="iconButton" onClick={doLogout} title="退出登录">
@@ -455,8 +491,45 @@ export default function HomePage() {
           )}
         </div>
 
+        <div className="deviceSearch">
+          <Search size={15} />
+          <input
+            type="search"
+            placeholder="搜索设备名 / ID"
+            value={deviceQuery}
+            onChange={(event) => setDeviceQuery(event.target.value)}
+          />
+          {deviceQuery && (
+            <button type="button" className="clearSearch" onClick={() => setDeviceQuery('')} title="清除">
+              ×
+            </button>
+          )}
+        </div>
+
+        {categories.length > 0 && (
+          <div className="filterChips">
+            <button
+              type="button"
+              className={`chip ${categoryFilter === 'all' ? 'active' : ''}`}
+              onClick={() => setCategoryFilter('all')}
+            >
+              全部 · {devices.length}
+            </button>
+            {categories.map((category) => (
+              <button
+                key={category}
+                type="button"
+                className={`chip ${categoryFilter === category ? 'active' : ''}`}
+                onClick={() => setCategoryFilter(category)}
+              >
+                {categoryLabel(category)} · {devices.filter((device) => device.category === category).length}
+              </button>
+            ))}
+          </div>
+        )}
+
         <div className="deviceList">
-          {devices.map((device) => {
+          {visibleDevices.map((device) => {
             const Icon = typeIcons[device.type] ?? Activity;
             return (
               <button
@@ -470,25 +543,37 @@ export default function HomePage() {
                 </span>
                 <span>
                   <strong>{device.name}</strong>
-                  <small>{device.id}</small>
+                  <small>{device.id} · {categoryLabel(device.category)}</small>
                 </span>
                 <i className={`stateDot ${device.disabled ? 'disabled' : device.state}`} />
               </button>
             );
           })}
-          {devices.length === 0 && <div className="empty">No devices yet. Seed demo data or register an agent.</div>}
+          {devices.length === 0 && <div className="empty">暂无设备。可先创建演示数据或注册一个 Agent。</div>}
+          {devices.length > 0 && visibleDevices.length === 0 && <div className="empty">没有匹配的设备</div>}
         </div>
       </aside>
 
       <section className="workspace">
         <header className="topbar">
           <div>
-            <span className="eyebrow">Unified terminal access</span>
+            <span className="eyebrow">Gateway console</span>
             <h2>{selected?.name ?? 'Waiting for devices'}</h2>
+            <p className="topbarMeta">
+              {selected
+                ? [selected.id, selected.model, selected.agentVersion].filter(Boolean).join(' · ')
+                : '注册设备后即可开始运维'}
+            </p>
           </div>
-          <div className="statusPill">
-            <span className={`stateDot ${selected?.disabled ? 'disabled' : selected?.state ?? 'offline'}`} />
-            {selected?.disabled ? 'disabled' : selected?.state ?? 'no device'}
+          <div className="topbarStatus">
+            <div className="statusPill">
+              <span className={`stateDot ${selected?.disabled ? 'disabled' : selected?.state ?? 'offline'}`} />
+              {deviceStateLabel(selected)}
+            </div>
+            <span className="liveMeta" title={autoRefresh ? '自动刷新已开启' : '自动刷新已关闭'}>
+              <i className={`liveDot ${autoRefresh ? 'on' : ''}`} />
+              {lastUpdatedAt ? `更新于 ${formatTime(lastUpdatedAt)}` : '未刷新'}
+            </span>
           </div>
         </header>
 
@@ -505,9 +590,9 @@ export default function HomePage() {
           {loading && <div className="loadingLine" />}
         </div>
 
-        {stats && <FleetDashboard stats={stats} />}
-        {authed && <AutomationPanel />}
-        {authed && authRequired && <ApiKeysPanel />}
+        <div className="overviewStack">
+          {stats && <FleetDashboard stats={stats} />}
+        </div>
 
         {selected ? (
           <div className="contentGrid">
@@ -525,10 +610,10 @@ export default function HomePage() {
             )}
             {selected.category && <OtaPanel device={selected} onChanged={() => refresh(selected.id)} />}
             <section className="panel devicePanel">
-              <PanelTitle icon={<Activity size={18} />} title="Device Profile" />
+              <PanelTitle icon={<Activity size={18} />} title="设备档案" />
               <dl className="details">
                 <div>
-                  <dt>Type</dt>
+                  <dt>类型</dt>
                   <dd>{selected.type}</dd>
                 </div>
                 <div>
@@ -536,19 +621,19 @@ export default function HomePage() {
                   <dd>{selected.agentVersion || '-'}</dd>
                 </div>
                 <div>
-                  <dt>Last seen</dt>
+                  <dt>最后在线</dt>
                   <dd>{formatTime(selected.lastSeenAt)}</dd>
                 </div>
                 <div>
-                  <dt>Labels</dt>
+                  <dt>标签</dt>
                   <dd>{formatKV(selected.labels)}</dd>
                 </div>
                 <div>
-                  <dt>Token issued</dt>
+                  <dt>Token 签发</dt>
                   <dd>{formatTime(selected.tokenIssuedAt)}</dd>
                 </div>
                 <div>
-                  <dt>Token used</dt>
+                  <dt>Token 使用</dt>
                   <dd>{formatTime(selected.tokenLastUsedAt)}</dd>
                 </div>
               </dl>
@@ -560,24 +645,24 @@ export default function HomePage() {
               <div className="actionRow">
                 <button type="button" className="textButton" onClick={resetToken} disabled={Boolean(actionBusy)}>
                   {actionBusy === 'token' ? <Loader2 size={16} className="spin" /> : <KeyRound size={16} />}
-                  {actionBusy === 'token' ? 'Resetting...' : 'Reset Token'}
+                  {actionBusy === 'token' ? '重置中...' : '重置 Token'}
                 </button>
                 <button type="button" className="textButton" onClick={toggleDisabled} disabled={Boolean(actionBusy)}>
                   {actionBusy === 'status' ? <Loader2 size={16} className="spin" /> : selected.disabled ? <Power size={16} /> : <ShieldOff size={16} />}
-                  {actionBusy === 'status' ? 'Updating...' : selected.disabled ? 'Enable Device' : 'Disable Device'}
+                  {actionBusy === 'status' ? '更新中...' : selected.disabled ? '启用设备' : '禁用设备'}
                 </button>
               </div>
               {lastToken && (
                 <div className="secretBox">
                   <div>
-                    <strong>New device token</strong>
-                    <small>Visible once. Store it in the agent token file.</small>
+                    <strong>新的设备 Token</strong>
+                    <small>仅显示一次，请保存到 Agent token 文件。</small>
                   </div>
                   <code>{lastToken}</code>
                   <button
                     type="button"
                     className="iconButton"
-                    title="Copy token"
+                    title="复制 Token"
                     onClick={() => navigator.clipboard?.writeText(lastToken)}
                   >
                     <Copy size={16} />
@@ -588,10 +673,10 @@ export default function HomePage() {
             </section>
 
             <section className="panel commandPanel">
-              <PanelTitle icon={<Send size={18} />} title="Command Dispatch" />
+              <PanelTitle icon={<Send size={18} />} title="命令下发" />
               <div className="formGrid">
                 <label>
-                  Command type
+                  命令类型
                   <select value={commandType} onChange={(event) => updateCommandType(event.target.value)}>
                     <option value="shell.exec">shell.exec</option>
                     <option value="gpio.write">gpio.write</option>
@@ -615,7 +700,7 @@ export default function HomePage() {
                 <div className="formMeta">
                   <span className={payloadError ? 'fieldError' : ''}>{payloadError || `${commandType} payload preset`}</span>
                   <button type="button" className="linkButton" onClick={() => setPayload(commandPayloads[commandType] ?? '{}')}>
-                    Reset payload
+                    重置 payload
                   </button>
                 </div>
                 <button
@@ -625,14 +710,14 @@ export default function HomePage() {
                   disabled={Boolean(payloadError) || actionBusy === 'command' || selected.disabled}
                 >
                   {actionBusy === 'command' ? <Loader2 size={16} className="spin" /> : <Play size={16} />}
-                  {actionBusy === 'command' ? 'Queueing...' : selected.disabled ? 'Device Disabled' : 'Queue Command'}
+                  {actionBusy === 'command' ? '入队中...' : selected.disabled ? '设备已禁用' : '下发命令'}
                 </button>
                 <div className="refreshControl">
                   <label className="switchLabel">
                     <input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} />
-                    <span>Auto refresh</span>
+                    <span>自动刷新</span>
                   </label>
-                  <span>{lastUpdatedAt ? `Updated ${formatTime(lastUpdatedAt)}` : 'Not refreshed yet'}</span>
+                  <span>{lastUpdatedAt ? `更新于 ${formatTime(lastUpdatedAt)}` : '尚未刷新'}</span>
                 </div>
               </div>
             </section>
@@ -640,21 +725,21 @@ export default function HomePage() {
             {numericKeys.length > 0 && <TelemetryChart device={selected} numericKeys={numericKeys} />}
 
             <section className="panel">
-              <PanelTitle icon={<Activity size={18} />} title="Telemetry" />
+              <PanelTitle icon={<Activity size={18} />} title="遥测数据" />
               <Table
-                columns={['Key', 'Value', 'Time']}
+                columns={['指标', '数值', '时间']}
                 rows={telemetry.map((point) => ({
                   key: point.id,
                   cells: [point.key, `${stringify(point.value)} ${point.unit ?? ''}`, formatTime(point.timestamp)],
                 }))}
-                empty="No telemetry yet"
+                empty="暂无遥测数据"
               />
             </section>
 
             <section className="panel">
-              <PanelTitle icon={<Terminal size={18} />} title="Commands" />
+              <PanelTitle icon={<Terminal size={18} />} title="命令历史" />
               <Table
-                columns={['Type', 'Status', 'Timing', 'Result']}
+                columns={['类型', '状态', '时间', '结果']}
                 rows={commands.map((command) => ({
                   key: command.id,
                   cells: [
@@ -664,12 +749,12 @@ export default function HomePage() {
                     command.error || truncateInline(stringifyPretty(command.result ?? command.payload ?? {}), 80),
                   ],
                 }))}
-                empty="No commands yet"
+                empty="暂无命令"
               />
             </section>
 
             <section className="panel eventPanel">
-              <PanelTitle icon={<History size={18} />} title="Recent Events" />
+              <PanelTitle icon={<History size={18} />} title="最近事件" />
               <div className="eventList">
                 {events.map((event) => (
                   <div key={event.id} className="eventRow">
@@ -684,13 +769,18 @@ export default function HomePage() {
         ) : (
           <div className="noSelection">
             <RadioTower size={36} />
-            <h3>No devices registered</h3>
+            <h3>暂无注册设备</h3>
             <button type="button" className="primaryButton" onClick={seedDemoDevices}>
               <Plus size={16} />
-              Seed Demo Devices
+              创建演示设备
             </button>
           </div>
         )}
+
+        <div className="adminToolsStack">
+          {authed && <AutomationPanel />}
+          {authed && authRequired && <ApiKeysPanel />}
+        </div>
       </section>
     </main>
   );
@@ -730,12 +820,9 @@ function LightPanel({
             {on ? '关灯' : '开灯'}
           </button>
           <span
+            className="colorPreview"
             title={color}
             style={{
-              width: 28,
-              height: 28,
-              borderRadius: 8,
-              border: '1px solid rgba(0,0,0,0.15)',
               background: on ? color : '#1b2330',
               opacity: on ? Math.max(0.25, brightness / 100) : 1,
             }}
@@ -866,7 +953,7 @@ function ClockPanel({
     <section className="panel commandPanel">
       <PanelTitle icon={<Clock size={18} />} title="时钟 / 天气屏" />
       <div className="formGrid">
-        <div className="formMeta">
+        <div className="segmentedControl">
           {['clock', 'calendar', 'weather'].map((value) => (
             <button
               key={value}
@@ -1056,7 +1143,7 @@ function GpsPanel({
     <section className="panel commandPanel">
       <PanelTitle icon={<MapPin size={18} />} title="GPS 定位 / 轨迹" />
       <div className="formGrid">
-        <svg viewBox="0 0 320 220" style={{ width: '100%', background: '#0e1622', borderRadius: 8 }}>
+        <svg viewBox="0 0 320 220" className="dataMap">
           {geo.fenceCircle && (
             <circle
               cx={geo.fenceCircle.cx}
@@ -1283,7 +1370,7 @@ function OtaPanel({ device, onChanged }: { device: Device; onChanged: () => void
   }
 
   return (
-    <section className="panel">
+    <section className="panel otaPanel">
       <PanelTitle icon={<UploadCloud size={18} />} title="固件 / OTA" />
       <div className="formGrid">
         <div className="formMeta">
@@ -1370,7 +1457,7 @@ function ApiKeysPanel() {
   }
 
   return (
-    <section className="panel">
+    <section className="panel apiKeyPanel">
       <PanelTitle icon={<KeyRound size={18} />} title="API 密钥" />
       <div className="formGrid">
         <span className="fieldHint">给脚本 / CI / 看板用的长期密钥，绑角色（viewer 只读 · operator 可操作 · admin 全权）。把密钥作为 Bearer Token 即可。</span>
@@ -1509,7 +1596,7 @@ function AutomationPanel() {
   }
 
   return (
-    <section className="panel">
+    <section className="panel automationPanel">
       <PanelTitle icon={<Zap size={18} />} title="自动化规则" />
       <div className="formGrid">
         {rules.length === 0 && <span className="fieldHint">还没有规则。比如「env.temp &gt; 30 → 给 light 类下发 light.power」。</span>}
@@ -1600,34 +1687,45 @@ function AutomationPanel() {
 }
 
 function FleetDashboard({ stats }: { stats: FleetStats }) {
-  const stat = (label: string, value: number, tone = '') => (
-    <span className={tone}>
-      {label} <strong>{value}</strong>
-    </span>
-  );
+  const statCards = [
+    { label: '设备总数', value: stats.total, tone: '' },
+    { label: '在线设备', value: stats.devicesByState.online ?? 0, tone: 'good' },
+    { label: '弱网设备', value: stats.devicesByState.stale ?? 0, tone: 'warn' },
+    { label: '离线设备', value: stats.devicesByState.offline ?? 0, tone: (stats.devicesByState.offline ?? 0) > 0 ? 'bad' : '' },
+    { label: '实时连接', value: stats.realtimeConnections, tone: 'good' },
+    { label: '禁用设备', value: stats.disabled, tone: stats.disabled > 0 ? 'bad' : '' },
+  ];
+  const activityCards = [
+    { label: '遥测累计', value: stats.telemetryReceived },
+    { label: '命令创建', value: stats.commandsCreated },
+    { label: '事件记录', value: stats.events },
+    { label: '固件版本', value: stats.firmware },
+  ];
   return (
-    <section className="panel">
+    <section className="panel fleetPanel">
       <PanelTitle icon={<Gauge size={18} />} title="舰队概览" />
-      <div className="formGrid">
-        <div className="formMeta" style={{ flexWrap: 'wrap', gap: 14 }}>
-          {stat('在线', stats.devicesByState.online ?? 0)}
-          {stat('弱网', stats.devicesByState.stale ?? 0)}
-          {stat('离线', stats.devicesByState.offline ?? 0, (stats.devicesByState.offline ?? 0) > 0 ? 'fieldError' : '')}
-          {stat('禁用', stats.disabled)}
-          {stat('实时连接', stats.realtimeConnections)}
-        </div>
-        <div className="formMeta" style={{ flexWrap: 'wrap', gap: 14 }}>
-          {Object.entries(stats.devicesByCategory).map(([k, v]) => (
-            <span key={k}>
-              {k} <strong>{v}</strong>
+      <div className="fleetGrid">
+        {statCards.map((item) => (
+          <div key={item.label} className={`fleetCard ${item.tone}`}>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+          </div>
+        ))}
+      </div>
+      <div className="fleetFooter">
+        <div className="categoryStrip">
+          {Object.entries(stats.devicesByCategory).map(([category, value]) => (
+            <span key={category}>
+              {categoryLabel(category)} <strong>{value}</strong>
             </span>
           ))}
         </div>
-        <div className="formMeta" style={{ flexWrap: 'wrap', gap: 14 }}>
-          {stat('遥测累计', stats.telemetryReceived)}
-          {stat('命令', stats.commandsCreated)}
-          {stat('事件', stats.events)}
-          {stat('固件', stats.firmware)}
+        <div className="activityStrip">
+          {activityCards.map((item) => (
+            <span key={item.label}>
+              {item.label} <strong>{item.value}</strong>
+            </span>
+          ))}
         </div>
       </div>
     </section>
@@ -1723,7 +1821,7 @@ function TelemetryChart({ device, numericKeys }: { device: Device; numericKeys: 
             </select>
           </label>
         </div>
-        <svg viewBox="0 0 320 120" style={{ width: '100%', background: '#0e1622', borderRadius: 8 }}>
+        <svg viewBox="0 0 320 120" className="chartSurface">
           {spark.line ? (
             <>
               <polyline points={spark.line} fill="none" stroke="#3ad1a8" strokeWidth={2} />
@@ -1821,4 +1919,30 @@ function stringifyPretty(value: unknown) {
 function truncateInline(value: string, limit: number) {
   const compact = value.replace(/\s+/g, ' ').trim();
   return compact.length > limit ? `${compact.slice(0, limit)}...` : compact;
+}
+
+function categoryLabel(category?: string) {
+  const labels: Record<string, string> = {
+    light: '灯光',
+    clock: '时钟',
+    gps: 'GPS',
+    voice: '语音',
+    generic: '通用',
+  };
+  return category ? labels[category] ?? category : '未分类';
+}
+
+function stateLabel(state?: string) {
+  const labels: Record<string, string> = {
+    online: '在线',
+    stale: '弱网',
+    offline: '离线',
+  };
+  return state ? labels[state] ?? state : '无状态';
+}
+
+function deviceStateLabel(device?: Device) {
+  if (!device) return '无设备';
+  if (device.disabled) return '已禁用';
+  return stateLabel(device.state);
 }
